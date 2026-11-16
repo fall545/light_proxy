@@ -1,0 +1,1 @@
+import{r as e}from"./index-D2gq4Jsr.js";function l(a="加载失败，请稍后重试"){const r=e(null);async function n(t){r.value=null;try{return await t(),!0}catch(u){return r.value=(u==null?void 0:u.message)||a,!1}}return{loadError:r,run:n}}export{l as u};

@@ -1,0 +1,33 @@
+{
+  "port": 29770,
+  "masterKey": "",
+  "setup": { "completed": false },
+  "autoUpdate": true,
+  "providers": [
+    {
+      "name": "my-openai",
+      "alias": "my",
+      "customLlmProvider": "openai",
+      "apiKey": "os.environ/MY_OPENAI_API_KEY",
+      "apiBase": "https://api.openai.com/v1",
+      "models": [
+        { "modelName": "my/gpt-4o-mini", "model": "gpt-4o-mini" }
+      ]
+    },
+    {
+      "name": "my-anthropic",
+      "customLlmProvider": "anthropic",
+      "apiKey": "os.environ/MY_ANTHROPIC_API_KEY",
+      "models": [
+        { "modelName": "my/claude-sonnet-4-5", "model": "claude-sonnet-4-5" },
+        {
+          "modelName": "my/mixed-model",
+          "model": "some-model",
+          "customLlmProvider": "openai",
+          "apiBase": "https://example.com/v1",
+          "apiKey": "os.environ/OTHER_KEY"
+        }
+      ]
+    }
+  ]
+}

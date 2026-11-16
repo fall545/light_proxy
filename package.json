@@ -1,0 +1,55 @@
+{
+  "name": "ellm-proxy",
+  "version": "0.0.25",
+  "description": "Self-hosted LLM gateway with admin web UI (single process, built-in process management)",
+  "keywords": [
+    "llm",
+    "llm-proxy",
+    "llm-gateway",
+    "ai-gateway",
+    "api-proxy",
+    "anthropic",
+    "claude",
+    "claude-code",
+    "openai",
+    "deepseek",
+    "relay"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/doyzhengdev/ellm-proxy.git"
+  },
+  "type": "module",
+  "bin": {
+    "ellm-proxy": "bin/ellm-proxy.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "docs",
+    "ellm.config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsx scripts/build-package.ts",
+    "prepack": "tsx scripts/build-package.ts",
+    "release": "tsx scripts/release.ts",
+    "release:checks": "tsx scripts/release.ts --checks",
+    "upgrade:local": "tsx scripts/dev-upgrade.ts",
+    "typecheck": "npx nve 22 tsc --noEmit",
+    "test": "npx nve 22 vitest run",
+    "test:coverage": "npx nve 22 vitest run --coverage"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@vitest/coverage-v8": "2.1.9",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
+  }
+}
