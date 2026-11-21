@@ -1,4 +1,4 @@
-# ellm-proxy
+# light-proxy
 原作者已下架,找不到原作者,但是太好用了,我就用agent整理了一下发出来了,还修了一些作者之前没修的bug(codex 请求格式等
 等)
 该项目非常适合本地部署管理自己的key,比oneapi和newapi简单多了
@@ -6,7 +6,7 @@
 **轻量、安全的本地 LLM 网关**——一条命令安装，一条命令启动，把你的 OpenAI / Anthropic 协议供应商和 API Key 统一收口为一个本地入口。
 
 - **部署成本极低**：单进程、单端口（默认 29770），常驻内存仅约 50 MB，你的日常电脑就能跑，无需服务器
-- **快速启动**：`npm i -g ellm-proxy && ellm-proxy start`，装完即起，首次启动自动创建示例配置，网页向导两分钟完成接入
+- **快速启动**：`npm i -g light-proxy && light-proxy start`，装完即起，首次启动自动创建示例配置，网页向导两分钟完成接入
 - **特别安全**：不收集任何数据、不上传任何数据。API Key 只存在你自己电脑上，请求只发给你自己配置的供应商，日志全部存本地
 
 ## 安全与隐私
@@ -21,13 +21,16 @@
 - **多供应商路由**：多家供应商 / 多个 API Key 统一管理，按模型路由、网页在线切换；内置 deepseek、kimi、zhipu、ark、openai 等 10 个供应商模板
 - **管理界面**：供应商管理、连通性测试、用量统计、请求日志，开箱即用零学习成本
 - **一键接入 AI 客户端**：网页上点一下，把 Claude Code、Codex、DeepSeek Harness（dsh）的流量指向本机网关（自动备份原配置、可还原）
+- **多密钥管理**：「密钥管理」页签发独立的客户端 Key（`lsk-` 前缀），可创建、编辑、删除、启用 / 禁用，每个 Key 可设 token 配额（具体上限或「不限」）；完整 Key 仅在创建时显示一次，本地只存 SHA-256 摘要
+- **实时监控**：「实时监控」页每 1–5 秒刷新，按密钥（正在调用的模型、每个模型的 token/s、进行中请求数）、按请求（模型、首字耗时、实时 token/s）、按上游模型（速度与累计消耗）展示
+- **长时间无输出不再“卡死”**：上游 3 秒内未返回响应头时，网关先回 SSE 头并在静默期间每 10 秒发送 `: keepalive` 注释，日志记录每段静默与首字耗时；上游随后报错时按客户端协议发送 error 事件
 - **开机自启**：三平台支持，登录即启动，免管理员权限
-- **自动更新**（可选）：发现新版本一键更新，失败自动回滚；自建 registry / 镜像源可用 `ELLM_UPDATE_REGISTRY` 指定
+- **自动更新**（可选）：发现新版本一键更新，失败自动回滚；自建 registry / 镜像源可用 `LIGHT_UPDATE_REGISTRY` 指定
 
 ## 安装
 
 ```bash
-npm i -g ellm-proxy
+npm i -g light-proxy
 ```
 
 无需预装特定 Node 版本——运行所需的 Node 22 由 CLI 自动解析，当前环境不满足时自动下载一次并缓存。
@@ -35,7 +38,7 @@ npm i -g ellm-proxy
 ## 使用方法
 
 ```bash
-ellm-proxy start    # 后台常驻启动（首次自动创建示例配置）
+light-proxy start    # 后台常驻启动（首次自动创建示例配置）
 ```
 
 1. 打开管理界面 `http://127.0.0.1:29770/`，首次访问进入**首启向导**：选择部署形态（本机使用 / 局域网公开），设置主密钥与登录账号（本机使用可全部跳过）
@@ -45,9 +48,27 @@ ellm-proxy start    # 后台常驻启动（首次自动创建示例配置）
 常用命令：
 
 ```bash
-ellm-proxy          # 已运行则显示服务信息，否则启动
-ellm-proxy stop     # 停止
-ellm-proxy restart  # 重启
+light-proxy          # 已运行则显示服务信息，否则启动
+light-proxy stop     # 停止
+light-proxy restart  # 重启
 ```
+
+### 多密钥与配额
+
+- 客户端可使用 `masterKey`（不计配额）或在「密钥管理」页创建的 `lsk-` Key，`Authorization: Bearer <key>` 与 `x-api-key: <key>` 均可
+- 配额按 token 计：输入 + 输出 + 缓存读写。请求**开始时**检查，已用量 ≥ 上限即返回 `429 exceeded_quota`；进行中的请求不会被中途截断，所以最后一个请求可能略超上限
+- 禁用的 Key 返回 `401`；「重置用量」可将已用量清零
+- 未设置 masterKey 且没有任何 Key 时网关保持开放（与旧版一致）；只要创建了任意一个 Key，就必须携带有效 Key 才能访问
+- 数据文件：`$LIGHT_DATA_DIR/keys.json`（默认 `<安装目录>/data/keys.json`，权限 600）
+- 管理 API：`GET/POST /api/keys`、`PUT|PATCH /api/keys/:id`（`name` / `enabled` / `quota`（`null` 表示不限）/ `resetUsage`）、`DELETE /api/keys/:id`；监控数据 `GET /api/monitor/live`
+
+实时监控的速度取最近 5 秒滑动窗口；流式输出期间的 token 数按增量文本估算，请求结束后以上游返回的真实 usage 计入累计值。累计统计保存在内存中，从服务启动时开始计算。
+
+### 流式相关环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LIGHT_SSE_EARLY_FLUSH_MS` | `3000` | 流式请求等待上游响应头的时间，超时后网关先回 SSE 头；在此之前上游报错会原样返回 HTTP 状态码 |
+| `LIGHT_SSE_HEARTBEAT_MS` | `10000` | 静默多久发送一次 `: keepalive` 注释并写一行日志 |
 
 > 说明：本工具为个人本地使用设计，非高并发架构，不建议作为商业代理部署。

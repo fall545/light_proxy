@@ -1,5 +1,5 @@
 {
-  "name": "ellm-proxy",
+  "name": "light-proxy",
   "version": "0.0.25",
   "description": "Self-hosted LLM gateway with admin web UI (single process, built-in process management)",
   "keywords": [
@@ -18,17 +18,17 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/doyzhengdev/ellm-proxy.git"
+    "url": "git+ssh://git@github.com/doyzhengdev/light-proxy.git"
   },
   "type": "module",
   "bin": {
-    "ellm-proxy": "bin/ellm-proxy.js"
+    "light-proxy": "bin/light-proxy.js"
   },
   "files": [
     "bin",
     "dist",
     "docs",
-    "ellm.config.example.json",
+    "light.config.example.json",
     "README.md",
     "LICENSE"
   ],

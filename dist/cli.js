@@ -20865,9 +20865,9 @@ import { dirname, resolve } from "node:path";
 import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
 var hereDir = dirname(fileURLToPath(import.meta.url));
-var APP_DIR = process.env["ELLM_APP_DIR"] ? resolve(cwd(), process.env["ELLM_APP_DIR"]) : resolve(hereDir, "..");
-var DATA_DIR = process.env["ELLM_DATA_DIR"] ? resolve(cwd(), process.env["ELLM_DATA_DIR"]) : resolve(APP_DIR, "data");
-var CONFIG_PATH = process.env["ELLM_CONFIG"] ? resolve(cwd(), process.env["ELLM_CONFIG"]) : resolve(APP_DIR, "ellm.config.json");
+var APP_DIR = process.env["LIGHT_APP_DIR"] ? resolve(cwd(), process.env["LIGHT_APP_DIR"]) : resolve(hereDir, "..");
+var DATA_DIR = process.env["LIGHT_DATA_DIR"] ? resolve(cwd(), process.env["LIGHT_DATA_DIR"]) : resolve(APP_DIR, "data");
+var CONFIG_PATH = process.env["LIGHT_CONFIG"] ? resolve(cwd(), process.env["LIGHT_CONFIG"]) : resolve(APP_DIR, "light.config.json");
 var DETAILS_DIR = resolve(DATA_DIR, "details");
 var IPINFO_FILE = resolve(DATA_DIR, "ipinfo.json");
 
@@ -21943,10 +21943,23 @@ var FINISH_REASON_MAP = {
 var OPENAI_TO_ANTHROPIC_STOP_REASON = {
   stop: "end_turn",
   length: "max_tokens",
-  tool_calls: "tool_use"
+  tool_calls: "tool_use",
+  // 上游内容过滤必须落到可区分的终态：映射成 end_turn 会让客户端把"空回复"当正常完成
+  // 并静默重试（Claude Code 场景下表现为什么都不显示）
+  content_filter: "refusal"
 };
 function mapOpenAiFinishReasonToAnthropicStopReason(openAiFinishReason) {
   return OPENAI_TO_ANTHROPIC_STOP_REASON[openAiFinishReason] ?? "end_turn";
+}
+/** 被上游内容过滤拦截时补的占位文本：只在过滤回复没有任何内容块时使用 */
+var CONTENT_FILTER_NOTICE = "[blocked by upstream content filter]";
+/**
+ * finish_reason 是否表示"上游内容过滤拦截"（先经 mapFinishReason 归一化，
+ * 因此 SAFETY / sensitive / guardrail_intervened / content_filtered 等都覆盖）
+ */
+function refusedByContentFilter(finishReason) {
+  const raw = strOrNull(finishReason) ?? "";
+  return raw !== "" && mapFinishReason(raw) === "content_filter";
 }
 
 // ../../node_modules/.pnpm/eventsource-parser@4.1.0/node_modules/eventsource-parser/dist/errors.js
@@ -22590,7 +22603,7 @@ function warnDroppedBlocks(dropped, requestId) {
   const summary = [...dropped.entries()].map(([type, count2]) => count2 > 1 ? `${type} x${String(count2)}` : type).join(", ");
   const suffix = requestId !== void 0 ? ` (requestId=${requestId})` : "";
   console.warn(
-    `[ellm] anthropic->openai bridge dropped unsupported content block(s): ${summary}${suffix}`
+    `[light] anthropic->openai bridge dropped unsupported content block(s): ${summary}${suffix}`
   );
 }
 function clampReasoningEffort(effort, max) {
@@ -22813,14 +22826,19 @@ function translateOpenaiResponseToAnthropic(openaiResponse) {
   const stopSequence = stopSequenceOf(firstChoice);
   let stopReason = stopSequence !== null ? "stop_sequence" : translateStopReason(firstChoice["finish_reason"]);
   const refusalText = refusalTextOf(message);
-  const isRefusalStop = refusalText !== null && stopReason !== "max_tokens";
+  // 上游内容过滤即使没带 refusal 文本也要落到 refusal 终态（否则客户端看到正常空回复并重试）
+  const filteredStop = stopSequence === null && stopReason !== "max_tokens" && refusedByContentFilter(firstChoice["finish_reason"]);
+  const isRefusalStop = refusalText !== null ? stopReason !== "max_tokens" : filteredStop;
   if (isRefusalStop) stopReason = "refusal";
+  const content = contentBlocksFromMessage(message);
+  if (isRefusalStop && content.length === 0)
+    content.push({ type: "text", text: CONTENT_FILTER_NOTICE });
   return {
     id: openaiResponse["id"],
     type: "message",
     role: "assistant",
     model: openaiResponse["model"] ?? "unknown-model",
-    content: contentBlocksFromMessage(message),
+    content,
     stop_reason: stopReason,
     ...isRefusalStop ? { stop_details: { type: "refusal" } } : {},
     stop_sequence: stopSequence,
@@ -22833,6 +22851,9 @@ function contentBlocksFromMessage(message) {
   for (const block of thinkingBlocks) {
     const rec = asRec(block);
     if (rec["type"] === "thinking") {
+      const thinkingText = strOrNull(rec["thinking"]) ?? "";
+      const signature = strOrNull(rec["signature"]);
+      if (thinkingText.trim() === "" && (signature === null || signature === "")) continue;
       content.push({
         type: "thinking",
         thinking: strOrNull(rec["thinking"]) ?? "",
@@ -22846,7 +22867,7 @@ function contentBlocksFromMessage(message) {
     }
   }
   const reasoning = message["reasoning_content"];
-  if (thinkingBlocks.length === 0 && typeof reasoning === "string" && reasoning !== "") {
+  if (thinkingBlocks.length === 0 && typeof reasoning === "string" && reasoning.trim() !== "") {
     content.push({ type: "thinking", thinking: reasoning, signature: null });
   }
   const text2 = message["content"];
@@ -22988,6 +23009,8 @@ var AnthropicSseBridge = class {
   #refusalText = "";
   /** 累积推理字符数（熔断判据之一） */
   #reasoningChars = 0;
+  /** 尚未开 thinking 块时收到的纯空白 reasoning：等到有实际内容再一并发出，全程空白则丢弃 */
+  #pendingReasoning = "";
   /** 累积推理文本中的手写调用次数（熔断判据之二） */
   #invokeHits = 0;
   #messageId;
@@ -23060,7 +23083,16 @@ var AnthropicSseBridge = class {
       frames.push(...this.#ensureOpenBlock("text"));
       frames.push(this.#deltaFrame({ type: "text_delta", text: refusalText }));
     }
-    const reasoning = delta["reasoning_content"];
+    let reasoning = delta["reasoning_content"];
+    if (typeof reasoning === "string" && reasoning !== "" && this.#openBlock !== "thinking") {
+      if (reasoning.trim() === "") {
+        this.#pendingReasoning += reasoning;
+        reasoning = "";
+      } else {
+        reasoning = this.#pendingReasoning + reasoning;
+        this.#pendingReasoning = "";
+      }
+    }
     if (typeof reasoning === "string" && reasoning !== "") {
       frames.push(
         ...this.#ensureOpenBlock("thinking", {
@@ -23172,8 +23204,19 @@ var AnthropicSseBridge = class {
     if (!this.#started || this.#finished) return [];
     this.#finished = true;
     const frames = [...this.#closeOpenBlock()];
-    const stopReason = this.#stopSequence !== null ? "stop_sequence" : this.#finishReason != null ? translateStopReason(this.#finishReason) : "end_turn";
-    const isRefusalStop = this.#refusalText !== "" && stopReason !== "max_tokens";
+    const recordedStopReason = this.#stopSequence !== null ? "stop_sequence" : this.#finishReason != null ? translateStopReason(this.#finishReason) : "end_turn";
+    // 上游内容过滤没带 refusal 文本时同样落到 refusal 终态；max_tokens 与命中停止串优先
+    const filteredStop = this.#stopSequence === null && this.#finishReason != null && recordedStopReason !== "max_tokens" && refusedByContentFilter(this.#finishReason);
+    const isRefusalStop = recordedStopReason !== "max_tokens" && (this.#refusalText !== "" || filteredStop);
+    const stopReason = isRefusalStop ? "refusal" : recordedStopReason;
+    // 过滤拦截且整条流没有任何内容块：补一段占位文本，避免客户端收到"正常空回复"
+    if (filteredStop && this.#refusalText === "" && this.#nextBlockIndex === 0) {
+      frames.push(
+        ...this.#ensureOpenBlock("text"),
+        this.#deltaFrame({ type: "text_delta", text: CONTENT_FILTER_NOTICE }),
+        ...this.#closeOpenBlock()
+      );
+    }
     frames.push(
       this.#frame({
         type: "message_delta",
@@ -26290,7 +26333,7 @@ function anthropicMessagesPt(rawMessages, model, llmProvider, modifyParams = fal
             const type = typeof m["type"] === "string" ? m["type"] : "";
             const thinkingText = typeof m["thinking"] === "string" ? m["thinking"] : "";
             const textBlock = typeof m["text"] === "string" ? m["text"] : "";
-            if (type === "thinking" && thinkingText.length > 0 && !isUnsignableThinkingBlock(m)) {
+            if (type === "thinking" && thinkingText.trim().length > 0 && !isUnsignableThinkingBlock(m)) {
               assistantContent.push(m);
             } else if (type === "text" && textBlock.length > 0) {
               const element = addCacheControlToContent(
@@ -26878,7 +26921,7 @@ function discardGarbageBuffer(state) {
   state.jsonBuffer.discardBuffered();
   state.chunkType = "valid_json";
   console.warn(
-    `[ellm] anthropic stream accumulated-json buffer exceeded ${String(JSON_BUFFER_LIMIT_BYTES)} bytes without yielding a value; discarding buffered garbage and resetting chunk parser`
+    `[light] anthropic stream accumulated-json buffer exceeded ${String(JSON_BUFFER_LIMIT_BYTES)} bytes without yielding a value; discarding buffered garbage and resetting chunk parser`
   );
 }
 function parseSseData(strLine, state) {
@@ -30219,7 +30262,7 @@ function readCliConfigFile(filePath) {
   const parsed = parseConfigFileAt(filePath, CLI_RETRY_ACTION);
   if (parsed === null) {
     throw new Error(
-      `\u914D\u7F6E\u6587\u4EF6\u4E0D\u5B58\u5728\uFF1A${filePath}\uFF08\u5148\u8FD0\u884C ellm-proxy config \u521B\u5EFA\uFF09`
+      `\u914D\u7F6E\u6587\u4EF6\u4E0D\u5B58\u5728\uFF1A${filePath}\uFF08\u5148\u8FD0\u884C light-proxy config \u521B\u5EFA\uFF09`
     );
   }
   return parsed;
@@ -30248,7 +30291,7 @@ var pkgRoot = (() => {
   let dir = HERE_DIR;
   for (let i2 = 0; i2 < 5; i2++) {
     try {
-      if (JSON.parse(readFileSync2(join(dir, "package.json"), "utf-8")).name === "ellm-proxy") {
+      if (JSON.parse(readFileSync2(join(dir, "package.json"), "utf-8")).name === "light-proxy") {
         return dir;
       }
     } catch {
@@ -30261,7 +30304,7 @@ var repoRoot = (() => {
   let dir = HERE_DIR;
   for (let i2 = 0; i2 < 6; i2++) {
     try {
-      if (JSON.parse(readFileSync2(join(dir, "package.json"), "utf-8")).name === "ellm") {
+      if (JSON.parse(readFileSync2(join(dir, "package.json"), "utf-8")).name === "light") {
         return dir;
       }
     } catch {
@@ -30270,7 +30313,7 @@ var repoRoot = (() => {
   }
   return null;
 })();
-var defaultAppDir = join(homedir(), ".ellm-proxy");
+var defaultAppDir = join(homedir(), ".light-proxy");
 function pkgVersion() {
   try {
     return JSON.parse(readFileSync2(join(pkgRoot, "package.json"), "utf-8")).version ?? "0.0.0";
@@ -30280,7 +30323,7 @@ function pkgVersion() {
 }
 function resolveServerJs(override) {
   if (override) return resolve2(override);
-  const envValue = process.env["ELLM_SERVER_JS"];
+  const envValue = process.env["LIGHT_SERVER_JS"];
   if (envValue) return resolve2(envValue);
   const candidates = [
     join(pkgRoot, "dist", "server.js"),
@@ -30290,14 +30333,14 @@ function resolveServerJs(override) {
 }
 function configPath(override, appDir = defaultAppDir) {
   if (override) return resolve2(override);
-  return process.env["ELLM_CONFIG"] ? resolve2(process.env["ELLM_CONFIG"]) : join(appDir, "ellm.config.json");
+  return process.env["LIGHT_CONFIG"] ? resolve2(process.env["LIGHT_CONFIG"]) : join(appDir, "light.config.json");
 }
 function ensureConfig(override, appDir = defaultAppDir) {
   const config = configPath(override, appDir);
   if (existsSync2(config)) return config;
   const candidates = [
-    join(pkgRoot, "ellm.config.example.json"),
-    ...repoRoot ? [join(repoRoot, "packages", "server", "ellm.config.example.json")] : []
+    join(pkgRoot, "light.config.example.json"),
+    ...repoRoot ? [join(repoRoot, "packages", "server", "light.config.example.json")] : []
   ];
   const example = candidates.find((p) => existsSync2(p));
   if (!example) {
@@ -30372,8 +30415,8 @@ function openLogFds(appDir) {
   const logsDir = join2(appDir, "logs");
   mkdirSync2(logsDir, { recursive: true });
   return {
-    out: openSync(join2(logsDir, "ellm-out.log"), "a"),
-    err: openSync(join2(logsDir, "ellm-err.log"), "a")
+    out: openSync(join2(logsDir, "light-out.log"), "a"),
+    err: openSync(join2(logsDir, "light-err.log"), "a")
   };
 }
 function spawnDetached(serverJs, appDir, extraEnv = {}, execPath2 = process.execPath) {
@@ -30417,7 +30460,7 @@ async function waitHttpOnline(port, { timeoutMs = 15e3, pollMs = 250 } = {}) {
     if (await isHttpOnline(port)) return;
     if (Date.now() >= deadline) {
       throw new Error(
-        `\u670D\u52A1\u7AEF\u53E3 ${port} \u5728 ${Math.round(timeoutMs / 1e3)}s \u5185\u672A\u5C31\u7EEA\uFF08\u53EF\u67E5\u770B\u65E5\u5FD7: ${"logs/ellm-err.log"}\uFF09`
+        `\u670D\u52A1\u7AEF\u53E3 ${port} \u5728 ${Math.round(timeoutMs / 1e3)}s \u5185\u672A\u5C31\u7EEA\uFF08\u53EF\u67E5\u770B\u65E5\u5FD7: ${"logs/light-err.log"}\uFF09`
       );
     }
     await new Promise((r) => setTimeout(r, pollMs));
@@ -44597,13 +44640,13 @@ import {
 import { spawn as spawn3 } from "node:child_process";
 import { homedir as homedir2, platform as platform8 } from "node:os";
 import { join as join6 } from "node:path";
-var AUTOSTART_VBS = "ellm-proxy-autostart.vbs";
-var AUTOSTART_CMD = "ellm-proxy-autostart.cmd";
-var PLIST_LABEL = "com.ellm-proxy.autostart";
-var LINUX_UNIT = "ellm-proxy.service";
+var AUTOSTART_VBS = "light-proxy-autostart.vbs";
+var AUTOSTART_CMD = "light-proxy-autostart.cmd";
+var PLIST_LABEL = "com.light-proxy.autostart";
+var LINUX_UNIT = "light-proxy.service";
 var OPT_OUT_FILE = "autostart.opt-out";
-var MARKER = "ellm-proxy-v3";
-var ENV_WHITELIST_PREFIX = "ELLM_";
+var MARKER = "light-proxy-v3";
+var ENV_WHITELIST_PREFIX = "LIGHT_";
 var ENV_WHITELIST_KEYS = /* @__PURE__ */ new Set([
   "WEBUI_USERNAME",
   "WEBUI_PASSWORD",
@@ -44652,7 +44695,7 @@ function assertCmdSafeEnv(key, value) {
   const bad = /["%\r\n]/;
   if (bad.test(key) || bad.test(value)) {
     throw new Error(
-      `\u73AF\u5883\u53D8\u91CF ${key} \u7684\u952E/\u503C\u542B cmd \u65E0\u6CD5\u5B89\u5168\u8F6C\u4E49\u7684\u5B57\u7B26\uFF08" % \u6216\u6362\u884C\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u5199\u5165\u81EA\u542F\u9879\uFF1B\u8BF7\u8C03\u6574\u8BE5\u53D8\u91CF\u540E\u91CD\u8BD5 ellm-proxy autostart on`
+      `\u73AF\u5883\u53D8\u91CF ${key} \u7684\u952E/\u503C\u542B cmd \u65E0\u6CD5\u5B89\u5168\u8F6C\u4E49\u7684\u5B57\u7B26\uFF08" % \u6216\u6362\u884C\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u5199\u5165\u81EA\u542F\u9879\uFF1B\u8BF7\u8C03\u6574\u8BE5\u53D8\u91CF\u540E\u91CD\u8BD5 light-proxy autostart on`
     );
   }
 }
@@ -44662,7 +44705,7 @@ function windowsBody(nodePath, target) {
     "@echo off",
     // echo 按 OEM 代码页（GBK）写重定向，node 按 UTF-8 写——不切页日志会两种编码混写必然一半乱码
     "chcp 65001 >nul",
-    `rem Auto-generated by "ellm-proxy autostart on" (${MARKER}). Disable with "ellm-proxy autostart off".`,
+    `rem Auto-generated by "light-proxy autostart on" (${MARKER}). Disable with "light-proxy autostart off".`,
     ...Object.entries(target.env).map(([k, v]) => {
       assertCmdSafeEnv(k, v);
       return `set "${k}=${v}"`;
@@ -44675,7 +44718,7 @@ function windowsBody(nodePath, target) {
 }
 function windowsVbsBody(cmdPath) {
   return [
-    `' Auto-generated by "ellm-proxy autostart on" (${MARKER}). Disable with "ellm-proxy autostart off".`,
+    `' Auto-generated by "light-proxy autostart on" (${MARKER}). Disable with "light-proxy autostart off".`,
     `CreateObject("WScript.Shell").Run """${cmdPath}""", 0, False`,
     ""
   ].join("\r\n");
@@ -44714,7 +44757,7 @@ function linuxBody(nodePath, target) {
   const envLines = Object.entries(target.env).map(([k, v]) => `Environment="${k}=${v.replace(/"/g, '\\"')}"`).join("\n");
   return [
     `[Unit]`,
-    `Description=ellm-proxy autostart (${MARKER}, direct service start)`,
+    `Description=light-proxy autostart (${MARKER}, direct service start)`,
     "After=default.target",
     "",
     "[Service]",
@@ -44852,7 +44895,7 @@ async function ensureAutostartOnStart(target) {
     if (status.optOut) return;
     const { itemPath } = await enableAutostart(target);
     console.log(`\u5DF2\u81EA\u52A8\u6CE8\u518C\u5F00\u673A\u81EA\u542F: ${itemPath}`);
-    console.log("\u7981\u7528\u65B9\u5F0F: ellm-proxy autostart off \u6216\u7BA1\u7406\u53F0\u8BBE\u7F6E\u9875\u3002");
+    console.log("\u7981\u7528\u65B9\u5F0F: light-proxy autostart off \u6216\u7BA1\u7406\u53F0\u8BBE\u7F6E\u9875\u3002");
   } catch (err) {
     console.warn(
       `\u5F00\u673A\u81EA\u542F\u6CE8\u518C\u5931\u8D25\uFF08\u4E0D\u5F71\u54CD\u672C\u6B21\u542F\u52A8\uFF09: ${err instanceof Error ? err.message : String(err)}`
@@ -44942,7 +44985,7 @@ function field(icon, label, value) {
 
 // ../../packages/server/src/cli/service.ts
 function resolveAppDir(workingDir) {
-  return workingDir ?? process.env["ELLM_APP_DIR"] ?? defaultAppDir;
+  return workingDir ?? process.env["LIGHT_APP_DIR"] ?? defaultAppDir;
 }
 function resolvePort(portEnv, configFile) {
   let port = Number(portEnv) || 0;
@@ -44972,7 +45015,7 @@ async function waitServiceOnline(appDir, timeoutMs = 15e3) {
     }
     if (Date.now() >= deadline) {
       throw new Error(
-        `\u670D\u52A1\u5728 ${String(Math.round(timeoutMs / 1e3))}s \u5185\u672A\u5C31\u7EEA\uFF08${lastError || "\u6700\u53EF\u80FD\u662F\u7AEF\u53E3\u88AB\u5360\u7528\u6216\u914D\u7F6E\u65E0\u6548"}\uFF09\u3002\u8BF7\u67E5\u770B\u65E5\u5FD7: ${join7(appDir, "logs", "ellm-err.log")}`
+        `\u670D\u52A1\u5728 ${String(Math.round(timeoutMs / 1e3))}s \u5185\u672A\u5C31\u7EEA\uFF08${lastError || "\u6700\u53EF\u80FD\u662F\u7AEF\u53E3\u88AB\u5360\u7528\u6216\u914D\u7F6E\u65E0\u6548"}\uFF09\u3002\u8BF7\u67E5\u770B\u65E5\u5FD7: ${join7(appDir, "logs", "light-err.log")}`
       );
     }
     dot();
@@ -44980,17 +45023,17 @@ async function waitServiceOnline(appDir, timeoutMs = 15e3) {
   }
 }
 async function doStart(opts) {
-  say("\u6B63\u5728\u542F\u52A8 ellm-proxy\uFF08\u5185\u7F6E\u8FDB\u7A0B\u7BA1\u7406\uFF0C\u540E\u53F0\u5E38\u9A7B\uFF09...", ICONS2.rocket);
+  say("\u6B63\u5728\u542F\u52A8 light-proxy\uFF08\u5185\u7F6E\u8FDB\u7A0B\u7BA1\u7406\uFF0C\u540E\u53F0\u5E38\u9A7B\uFF09...", ICONS2.rocket);
   const appDir = resolveAppDir(opts.workingDir);
   const config = ensureConfig(opts.config, appDir);
   const existing = readRunInfo(appDir);
   if (existing && isPidAlive(existing.pid)) {
     throw new Error(
-      `\u5DF2\u5728\u8FD0\u884C\uFF08pid ${String(existing.pid)}\uFF09\u3002\u8BF7\u5148\u505C\u6B62: ellm-proxy stop`
+      `\u5DF2\u5728\u8FD0\u884C\uFF08pid ${String(existing.pid)}\uFF09\u3002\u8BF7\u5148\u505C\u6B62: light-proxy stop`
     );
   }
   if (existing) clearRunInfo(appDir, existing.pid);
-  const budgetPort = resolvePort(opts.port ?? process.env["ELLM_PORT"], config);
+  const budgetPort = resolvePort(opts.port ?? process.env["LIGHT_PORT"], config);
   let port = budgetPort;
   if (port && !await isPortFree(port)) {
     const wanted = port;
@@ -45001,10 +45044,10 @@ async function doStart(opts) {
   }
   const serverJs = resolveServerJs(opts.serverJs);
   const interpreter = await resolveInterpreter();
-  const childEnv = { ELLM_APP_DIR: appDir };
-  if (port) childEnv["ELLM_PORT"] = String(port);
-  if (opts.config) childEnv["ELLM_CONFIG"] = opts.config;
-  if (opts.dataDir) childEnv["ELLM_DATA_DIR"] = opts.dataDir;
+  const childEnv = { LIGHT_APP_DIR: appDir };
+  if (port) childEnv["LIGHT_PORT"] = String(port);
+  if (opts.config) childEnv["LIGHT_CONFIG"] = opts.config;
+  if (opts.dataDir) childEnv["LIGHT_DATA_DIR"] = opts.dataDir;
   begin(`\u542F\u52A8\u670D\u52A1${port ? ` (\u7AEF\u53E3 ${String(port)})` : ""} `);
   const pid = spawnDetached(serverJs, appDir, childEnv, interpreter);
   try {
@@ -45026,7 +45069,7 @@ async function doStart(opts) {
     env: collectAutostartEnv({
       ...process.env,
       ...childEnv,
-      ...budgetPort ? { ELLM_PORT: String(budgetPort) } : {}
+      ...budgetPort ? { LIGHT_PORT: String(budgetPort) } : {}
     }),
     appDir,
     nodePath: interpreter
@@ -45054,7 +45097,7 @@ async function doStop(opts) {
 // ../../packages/server/src/cli/index.ts
 var MIN_MASTER_KEY = 8;
 var MIN_PASSWORD = 6;
-var APP_NAME = "ellm-proxy";
+var APP_NAME = "light-proxy";
 async function run(action) {
   try {
     await action();
@@ -45094,7 +45137,7 @@ function printStarted(result) {
   console.log();
   printInfo({
     appDir: result.appDir,
-    port: result.port || resolvePort(process.env["ELLM_PORT"], result.config),
+    port: result.port || resolvePort(process.env["LIGHT_PORT"], result.config),
     pid: result.pid
   });
 }
@@ -45113,12 +45156,12 @@ function printRunningInfo(appDir) {
   });
 }
 function withStartOptions(cmd) {
-  return cmd.option("--port <n>", "\u76D1\u542C\u7AEF\u53E3\uFF08\u4E5F\u53EF\u7528 ELLM_PORT \u73AF\u5883\u53D8\u91CF\uFF09").option("--config <path>", "\u914D\u7F6E\u6587\u4EF6\u8DEF\u5F84\uFF08\u4E5F\u53EF\u7528 ELLM_CONFIG \u73AF\u5883\u53D8\u91CF\uFF09").option(
+  return cmd.option("--port <n>", "\u76D1\u542C\u7AEF\u53E3\uFF08\u4E5F\u53EF\u7528 LIGHT_PORT \u73AF\u5883\u53D8\u91CF\uFF09").option("--config <path>", "\u914D\u7F6E\u6587\u4EF6\u8DEF\u5F84\uFF08\u4E5F\u53EF\u7528 LIGHT_CONFIG \u73AF\u5883\u53D8\u91CF\uFF09").option(
     "--data-dir <path>",
-    "\u6570\u636E\u76EE\u5F55\uFF08\u4E5F\u53EF\u7528 ELLM_DATA_DIR \u73AF\u5883\u53D8\u91CF\uFF1B\u9ED8\u8BA4 <appDir>/data\uFF09"
+    "\u6570\u636E\u76EE\u5F55\uFF08\u4E5F\u53EF\u7528 LIGHT_DATA_DIR \u73AF\u5883\u53D8\u91CF\uFF1B\u9ED8\u8BA4 <appDir>/data\uFF09"
   ).option(
     "--working-dir <path>",
-    "\u5E94\u7528\u76EE\u5F55\uFF08\u914D\u7F6E/\u6570\u636E/\u65E5\u5FD7\u57FA\u76EE\u5F55 ELLM_APP_DIR\uFF0C\u9ED8\u8BA4 ~/.ellm-proxy\uFF09"
+    "\u5E94\u7528\u76EE\u5F55\uFF08\u914D\u7F6E/\u6570\u636E/\u65E5\u5FD7\u57FA\u76EE\u5F55 LIGHT_APP_DIR\uFF0C\u9ED8\u8BA4 ~/.light-proxy\uFF09"
   ).option(
     "--server-js <path>",
     "\u663E\u5F0F\u6307\u5B9A dist/server.js \u8DEF\u5F84\uFF08\u9ED8\u8BA4\u672C\u5305 dist/server.js\uFF09"
@@ -45126,7 +45169,7 @@ function withStartOptions(cmd) {
 }
 async function doStartOrInfo(opts) {
   const normalized = absolutize(opts);
-  const appDir = normalized.workingDir ?? process.env["ELLM_APP_DIR"] ?? defaultAppDir;
+  const appDir = normalized.workingDir ?? process.env["LIGHT_APP_DIR"] ?? defaultAppDir;
   const existing = readRunInfo(appDir);
   if (existing && isPidAlive(existing.pid)) return printRunningInfo(appDir);
   printStarted(await doStart(normalized));
@@ -45143,7 +45186,7 @@ function sayStopNotStopped(result) {
   say(`${APP_NAME} \u672A\u5728\u8FD0\u884C\uFF08\u53EF\u80FD\u5DF2\u505C\u6B62\uFF09\u3002`, ICONS2.idle);
 }
 function buildCli() {
-  const cli2 = cac("ellm-proxy");
+  const cli2 = cac("light-proxy");
   withStartOptions(
     cli2.command("", "\u542F\u52A8\u670D\u52A1\uFF08\u5DF2\u8FD0\u884C\u5219\u663E\u793A\u670D\u52A1\u4FE1\u606F\uFF0C\u9009\u9879\u540C start\uFF09")
   ).action((opts) => run(() => doStartOrInfo(opts)));
@@ -45173,7 +45216,7 @@ function buildCli() {
   );
   cli2.command("stop", "\u505C\u6B62\u670D\u52A1\uFF08\u6309\u8FD0\u884C\u8BB0\u5F55\u505C\u6B62\u8FDB\u7A0B\uFF0C\u4E0D\u5F71\u54CD\u5176\u4ED6 node \u8FDB\u7A0B\uFF09").option(
     "--working-dir <path>",
-    "\u5E94\u7528\u76EE\u5F55\uFF08\u914D\u7F6E/\u6570\u636E/\u65E5\u5FD7\u57FA\u76EE\u5F55 ELLM_APP_DIR\uFF0C\u9ED8\u8BA4 ~/.ellm-proxy\uFF09"
+    "\u5E94\u7528\u76EE\u5F55\uFF08\u914D\u7F6E/\u6570\u636E/\u65E5\u5FD7\u57FA\u76EE\u5F55 LIGHT_APP_DIR\uFF0C\u9ED8\u8BA4 ~/.light-proxy\uFF09"
   ).action(
     (opts) => run(async () => {
       const { workingDir } = absolutize(opts);
@@ -45192,12 +45235,12 @@ function buildCli() {
   ).action((action) => {
     if (action !== "on" && action !== "off") {
       console.error(
-        `\u672A\u77E5\u53C2\u6570: ${action}\uFF08\u7528\u6CD5: ellm-proxy autostart on|off\uFF09`
+        `\u672A\u77E5\u53C2\u6570: ${action}\uFF08\u7528\u6CD5: light-proxy autostart on|off\uFF09`
       );
       process.exit(1);
     }
     return run(async () => {
-      const appDir = process.env["ELLM_APP_DIR"] ?? defaultAppDir;
+      const appDir = process.env["LIGHT_APP_DIR"] ?? defaultAppDir;
       if (action === "on") {
         const { itemPath } = await enableAutostart({
           serverJs: resolveServerJs(),
@@ -45207,7 +45250,7 @@ function buildCli() {
         });
         console.log("\u5F00\u673A\u81EA\u542F\u5DF2\u5F00\u542F\uFF08\u767B\u5F55\u65F6\u89E6\u53D1\uFF09\uFF1A");
         console.log(`  \u81EA\u542F\u9879 : ${itemPath}\uFF08\u767B\u5F55\u65F6\u65E0\u7A97\u53E3\u540E\u53F0\u542F\u52A8\uFF09`);
-        console.log("  \u7981\u7528\u65B9\u5F0F : ellm-proxy autostart off");
+        console.log("  \u7981\u7528\u65B9\u5F0F : light-proxy autostart off");
       } else {
         const { removed } = await disableAutostart({ appDir });
         if (!removed) {
@@ -45225,7 +45268,7 @@ function buildCli() {
       // 坏 JSON 与 master-key/account 同口径经 ConfigParseError 出自救指引并退出码 1，
       // 不再把损坏静默推迟到服务启动 / master-key 才暴露
       run(() => {
-        const appDir = process.env["ELLM_APP_DIR"] ?? defaultAppDir;
+        const appDir = process.env["LIGHT_APP_DIR"] ?? defaultAppDir;
         const config = ensureConfig(
           opts.config,
           appDir
@@ -45240,10 +45283,10 @@ function buildCli() {
     "\u67E5\u770B/\u8BBE\u7F6E\u4E3B\u5BC6\u94A5\uFF08--random \u968F\u673A\u751F\u6210 \xB7 --clear \u6E05\u9664\uFF1B\u8BBE\u7F6E\u540E /v1/* \u9700\u643A\u5E26 Bearer <key>\uFF09"
   ).option("--random", "\u968F\u673A\u751F\u6210 43 \u4F4D\u5F3A\u5BC6\u94A5").option("--clear", "\u6E05\u9664\u4E3B\u5BC6\u94A5\uFF08/v1/* \u6062\u590D\u514D\u9274\u6743\uFF0C\u4EC5\u5EFA\u8BAE\u672C\u673A\u4F7F\u7528\uFF09").option(
     "--config <path>",
-    "\u914D\u7F6E\u6587\u4EF6\u8DEF\u5F84\uFF08\u9ED8\u8BA4 ~/.ellm-proxy/ellm.config.json\uFF09"
+    "\u914D\u7F6E\u6587\u4EF6\u8DEF\u5F84\uFF08\u9ED8\u8BA4 ~/.light-proxy/light.config.json\uFF09"
   ).action(
     (key, opts) => run(() => {
-      const appDir = process.env["ELLM_APP_DIR"] ?? defaultAppDir;
+      const appDir = process.env["LIGHT_APP_DIR"] ?? defaultAppDir;
       ensureConfig(opts.config, appDir);
       const path7 = configPath(opts.config, appDir);
       const config = readCliConfigFile(path7);
@@ -45272,14 +45315,14 @@ ${generated}
             "\u5F53\u524D\u672A\u8BBE\u7F6E\u4E3B\u5BC6\u94A5\uFF1A/v1/* \u514D\u9274\u6743\uFF08\u672C\u5730\u4E2A\u4EBA\u4F7F\u7528\u6A21\u5F0F\uFF09\u3002"
           );
           console.log(
-            `\u8BBE\u7F6E\u65B9\u5F0F\uFF1Aellm-proxy master-key <key>\uFF08\u2265${String(MIN_MASTER_KEY)} \u4F4D\uFF09\u6216 --random`
+            `\u8BBE\u7F6E\u65B9\u5F0F\uFF1Alight-proxy master-key <key>\uFF08\u2265${String(MIN_MASTER_KEY)} \u4F4D\uFF09\u6216 --random`
           );
         } else {
           console.log(`\u5F53\u524D\u4E3B\u5BC6\u94A5: ${current}`);
         }
-        if (process.env["ELLM_MASTER_KEY"]) {
+        if (process.env["LIGHT_MASTER_KEY"]) {
           console.log(
-            "\u6CE8\u610F\uFF1A\u68C0\u6D4B\u5230\u73AF\u5883\u53D8\u91CF ELLM_MASTER_KEY\uFF08\u914D\u7F6E\u6587\u4EF6\u672A\u8BBE\u7F6E\u65F6\u624D\u751F\u6548\uFF09\u3002"
+            "\u6CE8\u610F\uFF1A\u68C0\u6D4B\u5230\u73AF\u5883\u53D8\u91CF LIGHT_MASTER_KEY\uFF08\u914D\u7F6E\u6587\u4EF6\u672A\u8BBE\u7F6E\u65F6\u624D\u751F\u6548\uFF09\u3002"
           );
         }
       }
@@ -45294,10 +45337,10 @@ ${generated}
     "\u6E05\u9664\u8D26\u53F7\uFF1A\u7BA1\u7406\u53F0\u514D\u767B\u5F55\u8BBF\u95EE\uFF08\u5982\u9700\u91CD\u65B0\u542F\u7528\u767B\u5F55\uFF0C\u518D\u6267\u884C account <\u7528\u6237\u540D> <\u5BC6\u7801>\uFF09"
   ).option(
     "--config <path>",
-    "\u914D\u7F6E\u6587\u4EF6\u8DEF\u5F84\uFF08\u9ED8\u8BA4 ~/.ellm-proxy/ellm.config.json\uFF09"
+    "\u914D\u7F6E\u6587\u4EF6\u8DEF\u5F84\uFF08\u9ED8\u8BA4 ~/.light-proxy/light.config.json\uFF09"
   ).action(
     (username, password, opts) => run(() => {
-      const appDir = process.env["ELLM_APP_DIR"] ?? defaultAppDir;
+      const appDir = process.env["LIGHT_APP_DIR"] ?? defaultAppDir;
       ensureConfig(opts.config, appDir);
       const path7 = configPath(opts.config, appDir);
       const config = readCliConfigFile(path7);
@@ -45333,13 +45376,13 @@ ${generated}
         if (name === "") {
           console.log("\u5F53\u524D\u672A\u8BBE\u7F6E\u8D26\u53F7\uFF1A\u7BA1\u7406\u53F0\u514D\u767B\u5F55\u8BBF\u95EE\uFF08\u7EAF\u672C\u673A\u4F7F\u7528\uFF09\u3002");
           console.log(
-            "\u542F\u7528\u767B\u5F55\uFF1Aellm-proxy account <username> <password>\uFF0C\u6216\u8BBE\u7F6E WEBUI_USERNAME/WEBUI_PASSWORD \u73AF\u5883\u53D8\u91CF\u3002"
+            "\u542F\u7528\u767B\u5F55\uFF1Alight-proxy account <username> <password>\uFF0C\u6216\u8BBE\u7F6E WEBUI_USERNAME/WEBUI_PASSWORD \u73AF\u5883\u53D8\u91CF\u3002"
           );
         } else {
           console.log(`\u5F53\u524D\u8D26\u53F7: ${name}`);
           console.log(`\u5F53\u524D\u5BC6\u7801: ${String(info["password"])}`);
         }
-        console.log("\u6E05\u9664\u8D26\u53F7\uFF08\u8F6C\u514D\u767B\u5F55\uFF09\uFF1Aellm-proxy account --reset");
+        console.log("\u6E05\u9664\u8D26\u53F7\uFF08\u8F6C\u514D\u767B\u5F55\uFF09\uFF1Alight-proxy account --reset");
       }
       console.log(`\u914D\u7F6E\u6587\u4EF6: ${path7}\uFF08\u540E\u7AEF\u52A8\u6001\u8BFB\u53D6\uFF0C\u65E0\u9700\u91CD\u542F\u5373\u65F6\u751F\u6548\uFF09`);
     })
@@ -45352,7 +45395,7 @@ ${generated}
       "pm2 \u6258\u7BA1\u5DF2\u9000\u5F79\uFF1A\u670D\u52A1\u73B0\u7531\u5185\u7F6E\u8FDB\u7A0B\u7BA1\u7406\u6258\u7BA1\uFF08\u540E\u53F0\u5E38\u9A7B + \u5D29\u6E83\u81EA\u6108 + \u5F00\u673A\u81EA\u542F\uFF09\u3002"
     );
     console.log(
-      "\u7B49\u4EF7\u547D\u4EE4\uFF1Aellm-proxy start / stop / restart\uFF1B\u67E5\u770B\u72B6\u6001\u76F4\u63A5\u8FD0\u884C ellm-proxy\uFF08\u65E0\u53C2\u6570\uFF09\u3002"
+      "\u7B49\u4EF7\u547D\u4EE4\uFF1Alight-proxy start / stop / restart\uFF1B\u67E5\u770B\u72B6\u6001\u76F4\u63A5\u8FD0\u884C light-proxy\uFF08\u65E0\u53C2\u6570\uFF09\u3002"
     );
     console.log("\u65E7\u7248 pm2 \u6B8B\u7559\u8FDB\u7A0B\u4F1A\u5728\u4E0B\u6B21 start/stop \u65F6\u81EA\u52A8\u6E05\u7406\u3002");
   });

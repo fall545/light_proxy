@@ -8830,9 +8830,9 @@ import { dirname, resolve } from "node:path";
 import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
 var hereDir = dirname(fileURLToPath(import.meta.url));
-var APP_DIR = process.env["ELLM_APP_DIR"] ? resolve(cwd(), process.env["ELLM_APP_DIR"]) : resolve(hereDir, "..");
-var DATA_DIR = process.env["ELLM_DATA_DIR"] ? resolve(cwd(), process.env["ELLM_DATA_DIR"]) : resolve(APP_DIR, "data");
-var CONFIG_PATH = process.env["ELLM_CONFIG"] ? resolve(cwd(), process.env["ELLM_CONFIG"]) : resolve(APP_DIR, "ellm.config.json");
+var APP_DIR = process.env["LIGHT_APP_DIR"] ? resolve(cwd(), process.env["LIGHT_APP_DIR"]) : resolve(hereDir, "..");
+var DATA_DIR = process.env["LIGHT_DATA_DIR"] ? resolve(cwd(), process.env["LIGHT_DATA_DIR"]) : resolve(APP_DIR, "data");
+var CONFIG_PATH = process.env["LIGHT_CONFIG"] ? resolve(cwd(), process.env["LIGHT_CONFIG"]) : resolve(APP_DIR, "light.config.json");
 var DETAILS_DIR = resolve(DATA_DIR, "details");
 var IPINFO_FILE = resolve(DATA_DIR, "ipinfo.json");
 function ensureDataDir() {
@@ -10941,7 +10941,7 @@ function matchDeployment(deployments, model) {
 var ConfigValidationError = class extends Error {
   issues;
   constructor(issues) {
-    super(`Invalid Ellm config:
+    super(`Invalid Light config:
   - ${issues.join("\n  - ")}`);
     this.name = "ConfigValidationError";
     this.issues = issues;
@@ -11457,10 +11457,23 @@ var FINISH_REASON_MAP = {
 var OPENAI_TO_ANTHROPIC_STOP_REASON = {
   stop: "end_turn",
   length: "max_tokens",
-  tool_calls: "tool_use"
+  tool_calls: "tool_use",
+  // 上游内容过滤必须落到可区分的终态：映射成 end_turn 会让客户端把"空回复"当正常完成
+  // 并静默重试（Claude Code 场景下表现为什么都不显示）
+  content_filter: "refusal"
 };
 function mapOpenAiFinishReasonToAnthropicStopReason(openAiFinishReason) {
   return OPENAI_TO_ANTHROPIC_STOP_REASON[openAiFinishReason] ?? "end_turn";
+}
+/** 被上游内容过滤拦截时补的占位文本：只在过滤回复没有任何内容块时使用 */
+var CONTENT_FILTER_NOTICE = "[blocked by upstream content filter]";
+/**
+ * finish_reason 是否表示"上游内容过滤拦截"（先经 mapFinishReason 归一化，
+ * 因此 SAFETY / sensitive / guardrail_intervened / content_filtered 等都覆盖）
+ */
+function refusedByContentFilter(finishReason) {
+  const raw2 = strOrNull(finishReason) ?? "";
+  return raw2 !== "" && mapFinishReason(raw2) === "content_filter";
 }
 
 // ../../node_modules/.pnpm/eventsource-parser@4.1.0/node_modules/eventsource-parser/dist/errors.js
@@ -12104,7 +12117,7 @@ function warnDroppedBlocks(dropped, requestId) {
   const summary = [...dropped.entries()].map(([type, count]) => count > 1 ? `${type} x${String(count)}` : type).join(", ");
   const suffix = requestId !== void 0 ? ` (requestId=${requestId})` : "";
   console.warn(
-    `[ellm] anthropic->openai bridge dropped unsupported content block(s): ${summary}${suffix}`
+    `[light] anthropic->openai bridge dropped unsupported content block(s): ${summary}${suffix}`
   );
 }
 function clampReasoningEffort(effort, max) {
@@ -12327,14 +12340,19 @@ function translateOpenaiResponseToAnthropic(openaiResponse) {
   const stopSequence = stopSequenceOf(firstChoice);
   let stopReason = stopSequence !== null ? "stop_sequence" : translateStopReason(firstChoice["finish_reason"]);
   const refusalText = refusalTextOf(message);
-  const isRefusalStop = refusalText !== null && stopReason !== "max_tokens";
+  // 上游内容过滤即使没带 refusal 文本也要落到 refusal 终态（否则客户端看到正常空回复并重试）
+  const filteredStop = stopSequence === null && stopReason !== "max_tokens" && refusedByContentFilter(firstChoice["finish_reason"]);
+  const isRefusalStop = refusalText !== null ? stopReason !== "max_tokens" : filteredStop;
   if (isRefusalStop) stopReason = "refusal";
+  const content = contentBlocksFromMessage(message);
+  if (isRefusalStop && content.length === 0)
+    content.push({ type: "text", text: CONTENT_FILTER_NOTICE });
   return {
     id: openaiResponse["id"],
     type: "message",
     role: "assistant",
     model: openaiResponse["model"] ?? "unknown-model",
-    content: contentBlocksFromMessage(message),
+    content,
     stop_reason: stopReason,
     ...isRefusalStop ? { stop_details: { type: "refusal" } } : {},
     stop_sequence: stopSequence,
@@ -12347,6 +12365,9 @@ function contentBlocksFromMessage(message) {
   for (const block of thinkingBlocks) {
     const rec = asRec(block);
     if (rec["type"] === "thinking") {
+      const thinkingText = strOrNull(rec["thinking"]) ?? "";
+      const signature = strOrNull(rec["signature"]);
+      if (thinkingText.trim() === "" && (signature === null || signature === "")) continue;
       content.push({
         type: "thinking",
         thinking: strOrNull(rec["thinking"]) ?? "",
@@ -12360,7 +12381,7 @@ function contentBlocksFromMessage(message) {
     }
   }
   const reasoning = message["reasoning_content"];
-  if (thinkingBlocks.length === 0 && typeof reasoning === "string" && reasoning !== "") {
+  if (thinkingBlocks.length === 0 && typeof reasoning === "string" && reasoning.trim() !== "") {
     content.push({ type: "thinking", thinking: reasoning, signature: null });
   }
   const text = message["content"];
@@ -12502,6 +12523,8 @@ var AnthropicSseBridge = class {
   #refusalText = "";
   /** 累积推理字符数（熔断判据之一） */
   #reasoningChars = 0;
+  /** 尚未开 thinking 块时收到的纯空白 reasoning：等到有实际内容再一并发出，全程空白则丢弃 */
+  #pendingReasoning = "";
   /** 累积推理文本中的手写调用次数（熔断判据之二） */
   #invokeHits = 0;
   #messageId;
@@ -12574,7 +12597,16 @@ var AnthropicSseBridge = class {
       frames.push(...this.#ensureOpenBlock("text"));
       frames.push(this.#deltaFrame({ type: "text_delta", text: refusalText }));
     }
-    const reasoning = delta["reasoning_content"];
+    let reasoning = delta["reasoning_content"];
+    if (typeof reasoning === "string" && reasoning !== "" && this.#openBlock !== "thinking") {
+      if (reasoning.trim() === "") {
+        this.#pendingReasoning += reasoning;
+        reasoning = "";
+      } else {
+        reasoning = this.#pendingReasoning + reasoning;
+        this.#pendingReasoning = "";
+      }
+    }
     if (typeof reasoning === "string" && reasoning !== "") {
       frames.push(
         ...this.#ensureOpenBlock("thinking", {
@@ -12686,8 +12718,19 @@ var AnthropicSseBridge = class {
     if (!this.#started || this.#finished) return [];
     this.#finished = true;
     const frames = [...this.#closeOpenBlock()];
-    const stopReason = this.#stopSequence !== null ? "stop_sequence" : this.#finishReason != null ? translateStopReason(this.#finishReason) : "end_turn";
-    const isRefusalStop = this.#refusalText !== "" && stopReason !== "max_tokens";
+    const recordedStopReason = this.#stopSequence !== null ? "stop_sequence" : this.#finishReason != null ? translateStopReason(this.#finishReason) : "end_turn";
+    // 上游内容过滤没带 refusal 文本时同样落到 refusal 终态；max_tokens 与命中停止串优先
+    const filteredStop = this.#stopSequence === null && this.#finishReason != null && recordedStopReason !== "max_tokens" && refusedByContentFilter(this.#finishReason);
+    const isRefusalStop = recordedStopReason !== "max_tokens" && (this.#refusalText !== "" || filteredStop);
+    const stopReason = isRefusalStop ? "refusal" : recordedStopReason;
+    // 过滤拦截且整条流没有任何内容块：补一段占位文本，避免客户端收到"正常空回复"
+    if (filteredStop && this.#refusalText === "" && this.#nextBlockIndex === 0) {
+      frames.push(
+        ...this.#ensureOpenBlock("text"),
+        this.#deltaFrame({ type: "text_delta", text: CONTENT_FILTER_NOTICE }),
+        ...this.#closeOpenBlock()
+      );
+    }
     frames.push(
       this.#frame({
         type: "message_delta",
@@ -15804,7 +15847,7 @@ function anthropicMessagesPt(rawMessages, model, llmProvider, modifyParams = fal
             const type = typeof m["type"] === "string" ? m["type"] : "";
             const thinkingText = typeof m["thinking"] === "string" ? m["thinking"] : "";
             const textBlock = typeof m["text"] === "string" ? m["text"] : "";
-            if (type === "thinking" && thinkingText.length > 0 && !isUnsignableThinkingBlock(m)) {
+            if (type === "thinking" && thinkingText.trim().length > 0 && !isUnsignableThinkingBlock(m)) {
               assistantContent.push(m);
             } else if (type === "text" && textBlock.length > 0) {
               const element = addCacheControlToContent(
@@ -16392,7 +16435,7 @@ function discardGarbageBuffer(state) {
   state.jsonBuffer.discardBuffered();
   state.chunkType = "valid_json";
   console.warn(
-    `[ellm] anthropic stream accumulated-json buffer exceeded ${String(JSON_BUFFER_LIMIT_BYTES)} bytes without yielding a value; discarding buffered garbage and resetting chunk parser`
+    `[light] anthropic stream accumulated-json buffer exceeded ${String(JSON_BUFFER_LIMIT_BYTES)} bytes without yielding a value; discarding buffered garbage and resetting chunk parser`
   );
 }
 function parseSseData(strLine, state) {
@@ -19726,8 +19769,8 @@ var defaultProviderConfigs = {
   openai: new OpenAiChatConfig(),
   anthropic: new AnthropicChatConfig()
 };
-var UPSTREAM_FIRST_BYTE_TIMEOUT_MS_ENV = "ELLM_UPSTREAM_FIRST_BYTE_TIMEOUT_MS";
-var UPSTREAM_IDLE_TIMEOUT_MS_ENV = "ELLM_UPSTREAM_IDLE_TIMEOUT_MS";
+var UPSTREAM_FIRST_BYTE_TIMEOUT_MS_ENV = "LIGHT_UPSTREAM_FIRST_BYTE_TIMEOUT_MS";
+var UPSTREAM_IDLE_TIMEOUT_MS_ENV = "LIGHT_UPSTREAM_IDLE_TIMEOUT_MS";
 function resolveUpstreamTimeouts(env = process.env) {
   const firstByteMs = positiveIntEnv(env[UPSTREAM_FIRST_BYTE_TIMEOUT_MS_ENV]);
   const idleMs = positiveIntEnv(env[UPSTREAM_IDLE_TIMEOUT_MS_ENV]);
@@ -20352,13 +20395,21 @@ function createLifecycleMiddleware(runner, options) {
         void finishRequest(c, rec, runner, options, {
           status,
           streaming: true,
-          error: upstreamError,
+          error: upstreamError ?? c.get("lightLateError") ?? null,
           usage: collectUsage !== null ? collectUsage() : c.get("traceUsage")
         });
       };
       const tapped = rec.capture ? c.res.body.pipeThrough(rec.tapClientStream()) : c.res.body;
+      const monitorId = c.get("requestId");
       const monitored = tapped.pipeThrough(
         new TransformStream({
+          transform(chunk, controller) {
+            controller.enqueue(chunk);
+            try {
+              LIGHT_MONITOR.chunk(monitorId, chunk);
+            } catch {
+            }
+          },
           flush() {
             finishOnce(200);
           }
@@ -20459,6 +20510,11 @@ async function finishRequest(c, rec, runner, options, args) {
     capture: rec.toContentCapture(args.streaming)
   };
   if (error !== null) await runner.run("onError", { error, ctx: hookCtx });
+  try {
+    LIGHT_MONITOR.finish(hookCtx, record);
+  } catch (monitorError) {
+    console.warn("[light] monitor finish failed:", monitorError);
+  }
   await runner.run("onFinish", record);
   if (options.traceSink !== void 0) {
     try {
@@ -20584,7 +20640,7 @@ function createGateway(options) {
   const runner = options.runner ?? new HookRunner().addAll(options.hooks);
   const captureEnabled = options.captureContent === true;
   const upstreamTimeouts = resolveUpstreamTimeouts();
-  const maxBodyBytes = options.maxBodyBytes ?? positiveIntEnv(process.env["ELLM_MAX_BODY_BYTES"]);
+  const maxBodyBytes = options.maxBodyBytes ?? positiveIntEnv(process.env["LIGHT_MAX_BODY_BYTES"]);
   app3.use("*", async (c, next) => {
     c.set("requestId", sanitizeRequestId(c.req.header("x-request-id")));
     c.set("deployments", options.deployments);
@@ -20752,11 +20808,19 @@ async function handleResponses(c) {
     upstreamModel: deployment.modelName,
     apiBase: deployment.apiBase
   };
-  const result = await dispatchResponsesViaChain(
-    deployment,
-    body,
-    c.get("dispatchCtx")
+  LIGHT_MONITOR.start(hookCtx);
+  const dispatchedR = await lightDispatch(
+    c,
+    dispatchResponsesViaChain(
+      deployment,
+      body,
+      c.get("dispatchCtx")
+    ),
+    "responses",
+    body["stream"] === true
   );
+  if (dispatchedR.response) return dispatchedR.response;
+  const result = dispatchedR.result;
   if (result.kind === "error") {
     c.set("traceError", {
       stage: "upstream",
@@ -20808,6 +20872,20 @@ async function handleCountTokens(c) {
   }
   return c.json(estimateInputTokens(body));
 }
+function lightStripBlankThinking(body) {
+  if (!Array.isArray(body["messages"])) return 0;
+  let dropped = 0;
+  body["messages"] = body["messages"].map((msg) => {
+    if (msg === null || typeof msg !== "object" || msg.role !== "assistant" || !Array.isArray(msg.content)) return msg;
+    const kept = msg.content.filter((block) => {
+      const blank = block !== null && typeof block === "object" && block.type === "thinking" && (typeof block.thinking !== "string" || block.thinking.trim() === "");
+      if (blank) dropped++;
+      return !blank;
+    });
+    return kept.length === msg.content.length || kept.length === 0 ? msg : { ...msg, content: kept };
+  });
+  return dropped;
+}
 async function handleCompletion(c, inboundFormat) {
   const runner = c.get("runner");
   const startedAt2 = Date.now();
@@ -20815,6 +20893,7 @@ async function handleCompletion(c, inboundFormat) {
   const body = {
     ...c.get("inboundBody")
   };
+  if (inboundFormat === "anthropic") lightStripBlankThinking(body);
   const hookCtx = createHookContext({
     requestId,
     inboundProtocol: inboundFormat,
@@ -20866,6 +20945,7 @@ async function handleCompletion(c, inboundFormat) {
     upstreamModel: deployment.modelName,
     apiBase: deployment.apiBase
   };
+  LIGHT_MONITOR.start(hookCtx);
   if (runner.has("onModelRequest") || runner.has("onModelResponse")) {
     const reqCtx = Object.assign(hookCtx, {
       model: hookCtx.model,
@@ -20877,11 +20957,18 @@ async function handleCompletion(c, inboundFormat) {
       }
     });
     await runner.run("onModelRequest", reqCtx);
-    const result2 = await dispatchChatCompletion(
-      deployment,
-      withInboundFormat(reqCtx.request.body, inboundFormat),
-      c.get("dispatchCtx")
+    const dispatched2 = await lightDispatch(
+      c,
+      dispatchChatCompletion(
+        deployment,
+        withInboundFormat(reqCtx.request.body, inboundFormat),
+        c.get("dispatchCtx")
+      ),
+      inboundFormat,
+      reqCtx.request.body?.stream === true
     );
+    if (dispatched2.response) return dispatched2.response;
+    const result2 = dispatched2.result;
     if (result2.kind === "error") {
       c.set("traceError", {
         stage: "upstream",
@@ -20910,11 +20997,18 @@ async function handleCompletion(c, inboundFormat) {
     body,
     inboundFormat
   );
-  const result = await dispatchChatCompletion(
-    deployment,
-    request,
-    c.get("dispatchCtx")
+  const dispatched = await lightDispatch(
+    c,
+    dispatchChatCompletion(
+      deployment,
+      request,
+      c.get("dispatchCtx")
+    ),
+    inboundFormat,
+    body["stream"] === true
   );
+  if (dispatched.response) return dispatched.response;
+  const result = dispatched.result;
   if (result.kind === "error") {
     c.set("traceError", {
       stage: "upstream",
@@ -20929,6 +21023,152 @@ async function handleCompletion(c, inboundFormat) {
   c.set("traceUsage", result.usage ?? null);
   return c.json(result.body);
 }
+// light: early SSE flush + heartbeats + phase logging (fixes "60s of silence" while upstream prefills)
+var LIGHT_EARLY_SSE_MS = Math.max(0, Number(process.env["LIGHT_SSE_EARLY_FLUSH_MS"] ?? 3e3) || 0);
+var LIGHT_HEARTBEAT_MS = Math.max(1e3, Number(process.env["LIGHT_SSE_HEARTBEAT_MS"] ?? 1e4) || 1e4);
+var LIGHT_SLOW_LOG_MS = 5e3;
+function lightSseErrorFrame(format, message, status) {
+  if (format === "anthropic") {
+    const type = status === 429 ? "rate_limit_error" : status === 529 || status === 503 ? "overloaded_error" : "api_error";
+    return `event: error
+data: ${JSON.stringify({ type: "error", error: { type, message } })}
+
+`;
+  }
+  if (format === "responses") {
+    return `event: error
+data: ${JSON.stringify({ type: "error", code: String(status ?? 502), message })}
+
+`;
+  }
+  return `data: ${JSON.stringify({ error: { message, type: "upstream_error", code: String(status ?? 502) } })}
+
+`;
+}
+function lightEndsAtEventBoundary(bytes) {
+  const n = bytes.length;
+  if (n < 2 || bytes[n - 1] !== 10) return false;
+  return bytes[n - 2] === 10 || n >= 3 && bytes[n - 2] === 13 && bytes[n - 3] === 10;
+}
+function lightHeartbeatStream(c, promise, format, t0, early) {
+  const requestId = c.get("requestId");
+  const enc = new TextEncoder();
+  let reader = null;
+  let timer = null;
+  let lastActivity = Date.now();
+  let atBoundary = true;
+  let firstByte = false;
+  let done = false;
+  const stop = () => {
+    done = true;
+    if (timer !== null) clearInterval(timer);
+    timer = null;
+  };
+  return new ReadableStream({
+    start(controller) {
+      if (early) controller.enqueue(enc.encode(": light: waiting for upstream\n\n"));
+      timer = setInterval(() => {
+        if (done) return;
+        const idle = Date.now() - lastActivity;
+        if (idle < LIGHT_HEARTBEAT_MS || !atBoundary) return;
+        try {
+          controller.enqueue(enc.encode(`: keepalive ${String(Math.round((Date.now() - t0) / 1e3))}s\n\n`));
+        } catch {
+          stop();
+          return;
+        }
+        console.log(
+          `[light] ${requestId} silent ${String(Math.round(idle / 1e3))}s (${reader === null ? "waiting for upstream response headers" : firstByte ? "mid-stream, upstream idle" : "headers received, waiting for first upstream byte"}) total ${String(Math.round((Date.now() - t0) / 1e3))}s`
+        );
+        lastActivity = Date.now();
+      }, Math.min(1e3, LIGHT_HEARTBEAT_MS));
+      timer.unref?.();
+    },
+    async pull(controller) {
+      if (reader === null) {
+        let r;
+        try {
+          r = await promise;
+        } catch (error) {
+          r = { kind: "error", status: 502, body: { error: { message: errorMessage2(error) } } };
+        }
+        if (done) return;
+        if (r.kind === "error" || !r.sse) {
+          const status = r.kind === "error" ? r.status : 502;
+          const message = r.kind === "error" ? errorPayloadOf(r.status, r.body).message : "upstream returned a non-streaming response to a streaming request";
+          c.set("lightLateError", { stage: "upstream", message, status });
+          console.log(`[light] ${requestId} upstream failed after SSE headers were sent (${String(Date.now() - t0)}ms): ${message}`);
+          stop();
+          controller.enqueue(enc.encode(lightSseErrorFrame(format, message, status)));
+          controller.close();
+          return;
+        }
+        c.set("lightLateResult", r);
+        if (early) console.log(`[light] ${requestId} upstream responded after ${String(Date.now() - t0)}ms`);
+        reader = (r.stream ?? r.body).getReader();
+      }
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        stop();
+        console.log(`[light] ${requestId} upstream stream error after ${String(Date.now() - t0)}ms: ${errorMessage2(error)}`);
+        throw error;
+      }
+      if (chunk.done) {
+        stop();
+        controller.close();
+        return;
+      }
+      const bytes = typeof chunk.value === "string" ? enc.encode(chunk.value) : chunk.value;
+      if (!firstByte) {
+        firstByte = true;
+        const ms = Date.now() - t0;
+        if (ms >= LIGHT_SLOW_LOG_MS) console.log(`[light] ${requestId} first upstream byte after ${String(ms)}ms`);
+      }
+      lastActivity = Date.now();
+      atBoundary = lightEndsAtEventBoundary(bytes);
+      controller.enqueue(bytes);
+    },
+    cancel(reason) {
+      stop();
+      if (reader !== null) void reader.cancel(reason).catch(() => {
+      });
+    }
+  }, { highWaterMark: 0 });
+}
+/**
+ * 流式请求：与上游竞速。LIGHT_SSE_EARLY_FLUSH_MS 内上游有结果 → 原语义（错误保留真实 HTTP 状态码）；
+ * 超时 → 立即回 200 SSE 头 + 心跳注释，上游结果到达后续流或发协议对应的 error 事件。
+ * 返回 { response } 直接返回给客户端，或 { result } 交回调用方走原有非流式处理。
+ */
+async function lightDispatch(c, promise, format, wantsStream) {
+  if (!wantsStream) return { result: await promise };
+  const t0 = Date.now();
+  let timer;
+  const raced = await Promise.race([
+    promise.then((r) => ({ r }), (error) => ({ r: { kind: "error", status: 502, body: { error: { message: errorMessage2(error), type: "upstream_error" } } } })),
+    new Promise((res) => {
+      timer = setTimeout(() => res(null), LIGHT_EARLY_SSE_MS);
+    })
+  ]);
+  clearTimeout(timer);
+  const headers = { ...SSE_HEADERS };
+  if (raced !== null) {
+    const r = raced.r;
+    if (r.kind === "error" || !r.sse) return { result: r };
+    c.set("collectUsage", r.collectUsage ?? null);
+    return { response: new Response(lightHeartbeatStream(c, Promise.resolve(r), format, t0, false), { status: 200, headers }) };
+  }
+  console.log(`[light] ${c.get("requestId")} no upstream response in ${String(LIGHT_EARLY_SSE_MS)}ms, sending SSE headers early (heartbeat every ${String(LIGHT_HEARTBEAT_MS / 1e3)}s)`);
+  c.set("collectUsage", () => {
+    const late = c.get("lightLateResult");
+    if (late === void 0 || late === null) return null;
+    return late.collectUsage ? late.collectUsage() : late.usage ?? null;
+  });
+  return { response: new Response(lightHeartbeatStream(c, promise, format, t0, true), { status: 200, headers }) };
+}
+
 function sseResponse(result) {
   return new Response(
     result.stream ?? result.body,
@@ -20978,13 +21218,15 @@ function errorPayloadOf(status, body) {
 async function runAuthorize(runner, hookCtx, authorizationHeader) {
   if (!runner.has("onAuthorize")) return { response: null, reason: null };
   let rejected = null;
+  let rejectedStatus = 401;
   const authCtx = {
     requestId: hookCtx.requestId,
     inboundProtocol: hookCtx.inboundProtocol,
     headers: authorizationHeader === void 0 ? {} : { authorization: authorizationHeader },
     principal: void 0,
-    reject: (reason) => {
+    reject: (reason, status) => {
       rejected = reason;
+      if (typeof status === "number") rejectedStatus = status;
     }
   };
   try {
@@ -20997,13 +21239,17 @@ async function runAuthorize(runner, hookCtx, authorizationHeader) {
     return {
       response: Response.json(
         {
-          error: {
+          error: rejectedStatus === 429 ? {
+            message: rejected,
+            type: "exceeded_quota",
+            code: "429"
+          } : {
             message: `Unauthorized: ${rejected}`,
             type: "authentication_error",
             code: "401"
           }
         },
-        { status: 401 }
+        { status: rejectedStatus }
       ),
       reason: rejected
     };
@@ -21011,8 +21257,8 @@ async function runAuthorize(runner, hookCtx, authorizationHeader) {
   return { response: null, reason: null };
 }
 
-// ../../packages/gateway/src/ellm.ts
-var Ellm = class {
+// ../../packages/gateway/src/light.ts
+var Light = class {
   hookRunner;
   _expanded;
   options;
@@ -21060,16 +21306,16 @@ var Ellm = class {
     );
     return top;
   }
-  /** 读取配置并监听；ELLM_PORT 环境变量优先于配置 port 字段（非法值回落配置值）。fetch 每请求现组装（reload 即时生效） */
+  /** 读取配置并监听；LIGHT_PORT 环境变量优先于配置 port 字段（非法值回落配置值）。fetch 每请求现组装（reload 即时生效） */
   serve(port2) {
-    const portResolved = port2 ?? positiveIntEnv(process.env["ELLM_PORT"]) ?? this.expanded.port;
+    const portResolved = port2 ?? positiveIntEnv(process.env["LIGHT_PORT"]) ?? this.expanded.port;
     const hostname = resolveServeHostname();
     serve({
       fetch: (req, base) => this.build().fetch(req, base),
       port: portResolved,
       hostname
     });
-    console.log(`ellm listening on http://${hostname}:${String(portResolved)}`);
+    console.log(`light listening on http://${hostname}:${String(portResolved)}`);
   }
   /** 构造期配置校验失败时抛出（供调用方精确 catch） */
   static get ConfigError() {
@@ -21110,7 +21356,7 @@ function readStartupConfig() {
     return loadConfigFile();
   } catch (error) {
     if (error instanceof ConfigParseError) {
-      console.error(`[ellm] ${error.message}`);
+      console.error(`[light] ${error.message}`);
       process.exit(1);
     }
     throw error;
@@ -21148,11 +21394,11 @@ function validateConfig(config2) {
 
 // ../../packages/server/src/gateway-runtime.ts
 function createRuntime(config2, hooks, options = {}) {
-  const ellm = new Ellm({ config: config2, traceSink: options.traceSink });
-  hooks.register(ellm);
+  const light = new Light({ config: config2, traceSink: options.traceSink });
+  hooks.register(light);
   const state = {
-    current: ellm,
-    port: ellm.expanded.port,
+    current: light,
+    port: light.expanded.port,
     rebuild(newConfig) {
       state.current.reload(newConfig);
       state.port = state.current.expanded.port;
@@ -21218,7 +21464,7 @@ function resolveMasterKey() {
   const fromFile = loadConfigFile()?.masterKey;
   if (typeof fromFile === "string" && fromFile.trim() !== "")
     return fromFile.trim();
-  const fromEnv = process.env["ELLM_MASTER_KEY"];
+  const fromEnv = process.env["LIGHT_MASTER_KEY"];
   return typeof fromEnv === "string" ? fromEnv.trim() : "";
 }
 function resolveLoginAccount() {
@@ -21282,7 +21528,7 @@ function credentialsIn(config2) {
   return typeof account?.username === "string" && account.username.trim() !== "" && typeof account?.password === "string" && account.password !== "";
 }
 function envCredentialConfigured() {
-  if ((process.env["ELLM_MASTER_KEY"] ?? "").trim() !== "") return true;
+  if ((process.env["LIGHT_MASTER_KEY"] ?? "").trim() !== "") return true;
   return Boolean(process.env["WEBUI_USERNAME"]) && Boolean(process.env["WEBUI_PASSWORD"]);
 }
 function hasAnyCredential() {
@@ -22207,7 +22453,7 @@ function persistTrace(trace) {
     duration: trace.durationMs
   });
   console.log(
-    `[ellm] ${trace.requestId} ${trace.route?.name ?? trace.http.path} -> ${String(trace.status)} ${String(trace.durationMs)}ms streaming=${String(streaming)}` + (trace.error !== null ? ` error=${trace.error.stage}: ${trace.error.message}` : "")
+    `[light] ${trace.requestId} ${trace.route?.name ?? trace.http.path} -> ${String(trace.status)} ${String(trace.durationMs)}ms streaming=${String(streaming)}` + (trace.error !== null ? ` error=${trace.error.stage}: ${trace.error.message}` : "")
   );
 }
 function createSqliteTraceSink() {
@@ -22223,7 +22469,7 @@ function createSqliteTraceSink() {
         try {
           persistTrace(trace);
         } catch (error) {
-          console.error("[ellm] trace \u843D\u5E93\u5931\u8D25:", error.message);
+          console.error("[light] trace \u843D\u5E93\u5931\u8D25:", error.message);
         }
       }
     } finally {
@@ -22235,7 +22481,7 @@ function createSqliteTraceSink() {
       if (queue.length >= QUEUE_CAPACITY) {
         queue.shift();
         console.warn(
-          `[ellm] trace \u961F\u5217\u5DF2\u6EE1\uFF08${String(QUEUE_CAPACITY)}\uFF09\uFF0C\u4E22\u5F03\u6700\u65E7\u4E00\u6761`
+          `[light] trace \u961F\u5217\u5DF2\u6EE1\uFF08${String(QUEUE_CAPACITY)}\uFF09\uFF0C\u4E22\u5F03\u6700\u65E7\u4E00\u6761`
         );
       }
       queue.push(trace);
@@ -22897,7 +23143,7 @@ function createTestApp(runtime2) {
   }
   async function callViaGateway(model, protocol) {
     const masterKey = resolveMasterKey();
-    const listenPort2 = Number(process.env["ELLM_PORT"] ?? runtime2.port);
+    const listenPort2 = Number(process.env["LIGHT_PORT"] ?? runtime2.port);
     const base = `http://127.0.0.1:${String(listenPort2)}`;
     const headers = {
       "Content-Type": "application/json"
@@ -23458,7 +23704,7 @@ function createStatusApp(runtime2, listen2) {
   const app3 = new Hono2();
   app3.get("/", (c) => {
     return c.json({
-      listenPort: Number(process.env["ELLM_PORT"] ?? runtime2.port),
+      listenPort: Number(process.env["LIGHT_PORT"] ?? runtime2.port),
       // 启动时的绑定判定结果（HOST env 覆盖 / allowLan 开关 / 凭据联锁），供前端
       // 如实展示「当前实际监听」；未传入（单测等无监听场景）时省略字段
       ...listen2 ? { listenHost: listen2.hostname, listenSource: listen2.source } : {}
@@ -23706,13 +23952,13 @@ import {
 import { spawn } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { join as join5 } from "node:path";
-var AUTOSTART_VBS = "ellm-proxy-autostart.vbs";
-var AUTOSTART_CMD = "ellm-proxy-autostart.cmd";
-var PLIST_LABEL = "com.ellm-proxy.autostart";
-var LINUX_UNIT = "ellm-proxy.service";
+var AUTOSTART_VBS = "light-proxy-autostart.vbs";
+var AUTOSTART_CMD = "light-proxy-autostart.cmd";
+var PLIST_LABEL = "com.light-proxy.autostart";
+var LINUX_UNIT = "light-proxy.service";
 var OPT_OUT_FILE = "autostart.opt-out";
-var MARKER = "ellm-proxy-v3";
-var ENV_WHITELIST_PREFIX = "ELLM_";
+var MARKER = "light-proxy-v3";
+var ENV_WHITELIST_PREFIX = "LIGHT_";
 var ENV_WHITELIST_KEYS = /* @__PURE__ */ new Set([
   "WEBUI_USERNAME",
   "WEBUI_PASSWORD",
@@ -23761,7 +24007,7 @@ function assertCmdSafeEnv(key, value) {
   const bad = /["%\r\n]/;
   if (bad.test(key) || bad.test(value)) {
     throw new Error(
-      `\u73AF\u5883\u53D8\u91CF ${key} \u7684\u952E/\u503C\u542B cmd \u65E0\u6CD5\u5B89\u5168\u8F6C\u4E49\u7684\u5B57\u7B26\uFF08" % \u6216\u6362\u884C\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u5199\u5165\u81EA\u542F\u9879\uFF1B\u8BF7\u8C03\u6574\u8BE5\u53D8\u91CF\u540E\u91CD\u8BD5 ellm-proxy autostart on`
+      `\u73AF\u5883\u53D8\u91CF ${key} \u7684\u952E/\u503C\u542B cmd \u65E0\u6CD5\u5B89\u5168\u8F6C\u4E49\u7684\u5B57\u7B26\uFF08" % \u6216\u6362\u884C\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u5199\u5165\u81EA\u542F\u9879\uFF1B\u8BF7\u8C03\u6574\u8BE5\u53D8\u91CF\u540E\u91CD\u8BD5 light-proxy autostart on`
     );
   }
 }
@@ -23771,7 +24017,7 @@ function windowsBody(nodePath, target) {
     "@echo off",
     // echo 按 OEM 代码页（GBK）写重定向，node 按 UTF-8 写——不切页日志会两种编码混写必然一半乱码
     "chcp 65001 >nul",
-    `rem Auto-generated by "ellm-proxy autostart on" (${MARKER}). Disable with "ellm-proxy autostart off".`,
+    `rem Auto-generated by "light-proxy autostart on" (${MARKER}). Disable with "light-proxy autostart off".`,
     ...Object.entries(target.env).map(([k, v]) => {
       assertCmdSafeEnv(k, v);
       return `set "${k}=${v}"`;
@@ -23784,7 +24030,7 @@ function windowsBody(nodePath, target) {
 }
 function windowsVbsBody(cmdPath) {
   return [
-    `' Auto-generated by "ellm-proxy autostart on" (${MARKER}). Disable with "ellm-proxy autostart off".`,
+    `' Auto-generated by "light-proxy autostart on" (${MARKER}). Disable with "light-proxy autostart off".`,
     `CreateObject("WScript.Shell").Run """${cmdPath}""", 0, False`,
     ""
   ].join("\r\n");
@@ -23823,7 +24069,7 @@ function linuxBody(nodePath, target) {
   const envLines = Object.entries(target.env).map(([k, v]) => `Environment="${k}=${v.replace(/"/g, '\\"')}"`).join("\n");
   return [
     `[Unit]`,
-    `Description=ellm-proxy autostart (${MARKER}, direct service start)`,
+    `Description=light-proxy autostart (${MARKER}, direct service start)`,
     "After=default.target",
     "",
     "[Service]",
@@ -24015,8 +24261,8 @@ function openLogFds(appDir) {
   const logsDir = join6(appDir, "logs");
   mkdirSync4(logsDir, { recursive: true });
   return {
-    out: openSync2(join6(logsDir, "ellm-out.log"), "a"),
-    err: openSync2(join6(logsDir, "ellm-err.log"), "a")
+    out: openSync2(join6(logsDir, "light-out.log"), "a"),
+    err: openSync2(join6(logsDir, "light-err.log"), "a")
   };
 }
 function spawnDetached(serverJs, appDir, extraEnv = {}, execPath = process.execPath) {
@@ -24034,14 +24280,14 @@ function selfRespawn(opts) {
   const doSpawn = () => {
     try {
       spawnDetached(opts.serverJs, opts.appDir, {
-        ELLM_RESPAWNED: "1",
+        LIGHT_RESPAWNED: "1",
         ...opts.extraEnv
       });
       console.log(
-        `[ellm] \u5DF2\u5B75\u5316\u540E\u7EE7\u8FDB\u7A0B\uFF08\u811A\u672C ${opts.serverJs}\uFF09\uFF0C\u5F53\u524D\u8FDB\u7A0B\u9000\u51FA`
+        `[light] \u5DF2\u5B75\u5316\u540E\u7EE7\u8FDB\u7A0B\uFF08\u811A\u672C ${opts.serverJs}\uFF09\uFF0C\u5F53\u524D\u8FDB\u7A0B\u9000\u51FA`
       );
     } catch (err) {
-      console.error("[ellm] \u5B75\u5316\u540E\u7EE7\u8FDB\u7A0B\u5931\u8D25:", err.message);
+      console.error("[light] \u5B75\u5316\u540E\u7EE7\u8FDB\u7A0B\u5931\u8D25:", err.message);
     }
     process.exit(opts.exitCode ?? 0);
   };
@@ -24097,11 +24343,11 @@ function bumpCrashCounter(appDir) {
 }
 function installCrashRecovery(opts) {
   process.on("uncaughtException", (err) => {
-    console.error("[ellm] \u672A\u6355\u83B7\u5F02\u5E38:", err?.stack ?? String(err));
+    console.error("[light] \u672A\u6355\u83B7\u5F02\u5E38:", err?.stack ?? String(err));
     const { allowed, count } = bumpCrashCounter(opts.appDir);
     if (!allowed) {
       console.error(
-        `[ellm] 1 \u5206\u949F\u5185\u5DF2\u81EA\u6108 ${String(count)} \u6B21\uFF0C\u505C\u6B62\u81EA\u52A8\u91CD\u542F\uFF08\u8BF7\u6392\u67E5\u65E5\u5FD7\u540E\u624B\u52A8 ellm-proxy start\uFF09`
+        `[light] 1 \u5206\u949F\u5185\u5DF2\u81EA\u6108 ${String(count)} \u6B21\uFF0C\u505C\u6B62\u81EA\u52A8\u91CD\u542F\uFF08\u8BF7\u6392\u67E5\u65E5\u5FD7\u540E\u624B\u52A8 light-proxy start\uFF09`
       );
       process.exit(1);
     }
@@ -24111,7 +24357,7 @@ function installCrashRecovery(opts) {
 
 // ../../packages/server/src/admin/updater.ts
 var UPDATER_SETTINGS_FILE = "updater.json";
-var PKG_NAME = "ellm-proxy";
+var PKG_NAME = "light-proxy";
 var DEFAULT_REGISTRY = "https://registry.npmjs.org/";
 var CHECK_INTERVAL_MS = 60 * 60 * 1e3;
 var FIRST_CHECK_DELAY_MS = 30 * 1e3;
@@ -24145,7 +24391,7 @@ function isUpdateSupported() {
   return isSupportedPkgRoot(PKG_ROOT);
 }
 function updateRegistry() {
-  return process.env["ELLM_UPDATE_REGISTRY"] || DEFAULT_REGISTRY;
+  return process.env["LIGHT_UPDATE_REGISTRY"] || DEFAULT_REGISTRY;
 }
 function isNewerVersion(latest, current) {
   const parse2 = (v) => String(v || "").split("-")[0].split(".").map((n) => Number(n) || 0);
@@ -24608,13 +24854,13 @@ import { dirname as dirname3, join as join8 } from "node:path";
 // ../../packages/server/src/admin/harness/backup.ts
 import { copyFileSync, existsSync as existsSync8, rmSync as rmSync4 } from "node:fs";
 function backupOnce(file) {
-  const bak = `${file}.ellm-bak`;
+  const bak = `${file}.light-bak`;
   if (existsSync8(bak)) return false;
   if (existsSync8(file)) copyFileSync(file, bak);
   return true;
 }
 function restoreFromBackup(file) {
-  const bak = `${file}.ellm-bak`;
+  const bak = `${file}.light-bak`;
   if (!existsSync8(bak)) return false;
   copyFileSync(bak, file);
   rmSync4(bak, { force: true });
@@ -25323,10 +25569,10 @@ function parse(toml, { maxDepth = 1e3, integersAsBigInt } = {}) {
 }
 
 // ../../packages/server/src/admin/harness/codex.ts
-var PROVIDER_ID = "ellm-proxy";
+var PROVIDER_ID = "light-proxy";
 var CODEX_CONFIG = join9(homedir3(), ".codex", "config.toml");
-var ZSHRC_BLOCK_START = "# >>> ellm-proxy codex switch >>>";
-var ZSHRC_BLOCK_END = "# <<< ellm-proxy codex switch <<<";
+var ZSHRC_BLOCK_START = "# >>> light-proxy codex switch >>>";
+var ZSHRC_BLOCK_END = "# <<< light-proxy codex switch <<<";
 function shellEscape(value) {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/`/g, "\\`").replace(/\$/g, "\\$");
 }
@@ -25400,7 +25646,7 @@ function removeProviderSection(text) {
   const out = [];
   let skipping = false;
   for (const line of lines) {
-    if (/^\s*\[model_providers\.ellm-proxy\]\s*$/.test(line)) {
+    if (/^\s*\[model_providers\.light-proxy\]\s*$/.test(line)) {
       skipping = true;
       continue;
     }
@@ -25444,26 +25690,26 @@ function codexEnable(opts) {
   text = setTopLevelProvider(text);
   const section = [
     `[model_providers.${PROVIDER_ID}]`,
-    `name = "ellm-proxy gateway"`,
+    `name = "light-proxy gateway"`,
     `base_url = "${opts.gatewayBase}/v1"`,
     `wire_api = "chat"`,
-    `env_key = "ELLM_PROXY_API_KEY"`
+    `env_key = "LIGHT_PROXY_API_KEY"`
   ].join("\n");
   text = text.replace(/\s*$/, "") + "\n\n" + section + "\n";
   validateTomlText(text, true);
   writeFileSync6(CODEX_CONFIG, text, "utf-8");
-  return opts.apiKey ? setUserEnvVar("ELLM_PROXY_API_KEY", opts.apiKey) : false;
+  return opts.apiKey ? setUserEnvVar("LIGHT_PROXY_API_KEY", opts.apiKey) : false;
 }
 function codexDisable() {
   const restored = restoreFromBackup(CODEX_CONFIG);
-  const envRemoved = removeUserEnvVar("ELLM_PROXY_API_KEY");
-  delete process.env["ELLM_PROXY_API_KEY"];
+  const envRemoved = removeUserEnvVar("LIGHT_PROXY_API_KEY");
+  delete process.env["LIGHT_PROXY_API_KEY"];
   if (restored) return true;
   const text = readCodexConfig();
   if (!text || !codexProviderActive(text)) return envRemoved;
   let out = removeProviderSection(text);
   out = out.split("\n").filter(
-    (line) => !/^\s*model_provider\s*=\s*["']?ellm-proxy["']?\s*$/.test(line)
+    (line) => !/^\s*model_provider\s*=\s*["']?light-proxy["']?\s*$/.test(line)
   ).join("\n");
   validateTomlText(out, false);
   writeFileSync6(CODEX_CONFIG, out, "utf-8");
@@ -25477,7 +25723,7 @@ import { homedir as homedir4 } from "node:os";
 import { dirname as dirname5, join as join10 } from "node:path";
 var KEY_REF = "DEEPSEEK_API_KEY";
 var CREDENTIALS_VERSION = 1;
-var PLACEHOLDER_KEY = "ellm-proxy";
+var PLACEHOLDER_KEY = "light-proxy";
 var dshHome = () => process.env.DSH_HOME || join10(homedir4(), ".dsh");
 var settingsFile = () => join10(dshHome(), "settings.yaml");
 var credentialsFile = () => join10(dshHome(), ".credentials.yaml");
@@ -25673,7 +25919,7 @@ function createHarnessRoutes(ctx) {
         ok: true,
         claudeCode: true,
         file: "~/.claude/settings.json",
-        note: "\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A settings.json.ellm-bak\uFF0C\u91CD\u542F Claude Code \u4F1A\u8BDD\u540E\u751F\u6548"
+        note: "\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A settings.json.light-bak\uFF0C\u91CD\u542F Claude Code \u4F1A\u8BDD\u540E\u751F\u6548"
       });
     }
     const changed = claudeCodeDisable(gatewayBase);
@@ -25698,7 +25944,7 @@ function createHarnessRoutes(ctx) {
         ok: true,
         codex: true,
         file: "~/.codex/config.toml",
-        note: masterKey ? envWritten ? "\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A config.toml.ellm-bak\uFF1B\u5DF2\u81EA\u52A8\u5199\u5165\u7528\u6237\u73AF\u5883\u53D8\u91CF ELLM_PROXY_API_KEY\uFF08Windows \u5199\u6CE8\u518C\u8868 / macOS \u5199 ~/.zshrc\uFF0C\u5BF9\u4E4B\u540E\u65B0\u5F00\u7684\u7EC8\u7AEF\u4E0E Codex \u4F1A\u8BDD\u751F\u6548\uFF09" : `\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A config.toml.ellm-bak\uFF1B\u5F53\u524D\u5E73\u53F0\u4E0D\u652F\u6301\u81EA\u52A8\u5199\u5165\uFF0C\u8BF7\u624B\u52A8\u8BBE\u7F6E\u73AF\u5883\u53D8\u91CF ELLM_PROXY_API_KEY=${masterKey}` : "\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A config.toml.ellm-bak\uFF1B\u8BF7\u8BBE\u7F6E\u73AF\u5883\u53D8\u91CF ELLM_PROXY_API_KEY\uFF08\u7F51\u5173\u672A\u914D masterKey \u65F6\u53D6\u503C\u4EFB\u610F\uFF09"
+        note: masterKey ? envWritten ? "\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A config.toml.light-bak\uFF1B\u5DF2\u81EA\u52A8\u5199\u5165\u7528\u6237\u73AF\u5883\u53D8\u91CF LIGHT_PROXY_API_KEY\uFF08Windows \u5199\u6CE8\u518C\u8868 / macOS \u5199 ~/.zshrc\uFF0C\u5BF9\u4E4B\u540E\u65B0\u5F00\u7684\u7EC8\u7AEF\u4E0E Codex \u4F1A\u8BDD\u751F\u6548\uFF09" : `\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A config.toml.light-bak\uFF1B\u5F53\u524D\u5E73\u53F0\u4E0D\u652F\u6301\u81EA\u52A8\u5199\u5165\uFF0C\u8BF7\u624B\u52A8\u8BBE\u7F6E\u73AF\u5883\u53D8\u91CF LIGHT_PROXY_API_KEY=${masterKey}` : "\u5DF2\u5907\u4EFD\u539F\u6587\u4EF6\u4E3A config.toml.light-bak\uFF1B\u8BF7\u8BBE\u7F6E\u73AF\u5883\u53D8\u91CF LIGHT_PROXY_API_KEY\uFF08\u7F51\u5173\u672A\u914D masterKey \u65F6\u53D6\u503C\u4EFB\u610F\uFF09"
       });
     }
     const changed = codexDisable();
@@ -25720,7 +25966,7 @@ function createHarnessRoutes(ctx) {
         ok: true,
         dsh: true,
         file: "~/.dsh/settings.yaml",
-        note: masterKey ? "\u5DF2\u5199\u5165 settings.yaml\uFF08llm-deepseek.baseURL\uFF09\u4E0E .credentials.yaml\uFF08refs.DEEPSEEK_API_KEY\uFF09\uFF0C\u539F\u6587\u4EF6\u5907\u4EFD\u4E3A *.ellm-bak\u3002\u6CE8\u610F\uFF1A\u8FDB\u7A0B\u73AF\u5883\u91CC\u5DF2\u8BBE DEEPSEEK_API_KEY \u65F6\u5176\u4F18\u5148\u7EA7\u66F4\u9AD8\uFF0C\u9700\u81EA\u884C\u6539\u7528\u7F51\u5173 masterKey\uFF1B\u6A21\u578B\u8BF7\u5728 dsh \u5185\u9009\u62E9\u4E0E\u7F51\u5173\u90E8\u7F72\u540D\u4E00\u81F4\u7684\u6A21\u578B" : "\u5DF2\u5199\u5165 settings.yaml \u4E0E .credentials.yaml\uFF08\u7F51\u5173\u672A\u914D masterKey\uFF0C\u5BC6\u94A5\u4E3A\u5360\u4F4D\u503C\u5373\u53EF\u653E\u884C\uFF09\uFF0C\u539F\u6587\u4EF6\u5907\u4EFD\u4E3A *.ellm-bak\u3002\u6A21\u578B\u8BF7\u5728 dsh \u5185\u9009\u62E9\u4E0E\u7F51\u5173\u90E8\u7F72\u540D\u4E00\u81F4\u7684\u6A21\u578B"
+        note: masterKey ? "\u5DF2\u5199\u5165 settings.yaml\uFF08llm-deepseek.baseURL\uFF09\u4E0E .credentials.yaml\uFF08refs.DEEPSEEK_API_KEY\uFF09\uFF0C\u539F\u6587\u4EF6\u5907\u4EFD\u4E3A *.light-bak\u3002\u6CE8\u610F\uFF1A\u8FDB\u7A0B\u73AF\u5883\u91CC\u5DF2\u8BBE DEEPSEEK_API_KEY \u65F6\u5176\u4F18\u5148\u7EA7\u66F4\u9AD8\uFF0C\u9700\u81EA\u884C\u6539\u7528\u7F51\u5173 masterKey\uFF1B\u6A21\u578B\u8BF7\u5728 dsh \u5185\u9009\u62E9\u4E0E\u7F51\u5173\u90E8\u7F72\u540D\u4E00\u81F4\u7684\u6A21\u578B" : "\u5DF2\u5199\u5165 settings.yaml \u4E0E .credentials.yaml\uFF08\u7F51\u5173\u672A\u914D masterKey\uFF0C\u5BC6\u94A5\u4E3A\u5360\u4F4D\u503C\u5373\u53EF\u653E\u884C\uFF09\uFF0C\u539F\u6587\u4EF6\u5907\u4EFD\u4E3A *.light-bak\u3002\u6A21\u578B\u8BF7\u5728 dsh \u5185\u9009\u62E9\u4E0E\u7F51\u5173\u90E8\u7F72\u540D\u4E00\u81F4\u7684\u6A21\u578B"
       });
     }
     const changed = dshDisable(gatewayBase, masterKey);
@@ -25961,7 +26207,7 @@ import { join as join12, resolve as resolve6 } from "node:path";
 import { dirname as dirname6 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 var hereDir2 = dirname6(fileURLToPath3(import.meta.url));
-var WEBUI_DIST_DIR = process.env["ELLM_WEBUI_DIR"] ? resolve6(process.cwd(), process.env["ELLM_WEBUI_DIR"]) : [
+var WEBUI_DIST_DIR = process.env["LIGHT_WEBUI_DIR"] ? resolve6(process.cwd(), process.env["LIGHT_WEBUI_DIR"]) : [
   join12(hereDir2, "web-ui"),
   // 发布包模式：dist/web-ui 与 bundle 同级
   resolve6(hereDir2, "..", "..", "..", "..", "app", "web", "dist"),
@@ -25997,6 +26243,476 @@ function registerWebUi(app3) {
   });
 }
 
+// ../../packages/server/src/keys-monitor.ts (light: multi-key management + live monitor)
+import { readFileSync as lightReadFile, writeFileSync as lightWriteFile, renameSync as lightRename, existsSync as lightExists } from "node:fs";
+import { createHash as lightHash, randomBytes as lightRandom } from "node:crypto";
+import { join as lightJoin } from "node:path";
+var LIGHT_KEY_PREFIX = "lsk-";
+function lightHashKey(raw2) {
+  return lightHash("sha256").update(raw2).digest("hex");
+}
+function lightKeyTokens(usage) {
+  if (usage === null || usage === void 0) return 0;
+  return (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0) + (usage.cacheReadInputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0);
+}
+function createKeyStore(dir) {
+  const file = lightJoin(dir, "keys.json");
+  let keys = [];
+  let byHash = /* @__PURE__ */ new Map();
+  let saveTimer = null;
+  const reindex = () => {
+    byHash = new Map(keys.map((k) => [k.hash, k]));
+  };
+  const load = () => {
+    try {
+      if (lightExists(file)) {
+        const parsed = JSON.parse(lightReadFile(file, "utf-8"));
+        keys = Array.isArray(parsed?.keys) ? parsed.keys : [];
+      }
+    } catch (error) {
+      console.error(`[light] keys.json 读取失败: ${error.message}`);
+      keys = [];
+    }
+    reindex();
+  };
+  const saveNow = () => {
+    if (saveTimer !== null) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    const tmp = `${file}.tmp`;
+    lightWriteFile(tmp, JSON.stringify({ version: 1, keys }, null, 2), { mode: 384 });
+    lightRename(tmp, file);
+  };
+  const saveSoon = () => {
+    if (saveTimer !== null) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      try {
+        saveNow();
+      } catch (error) {
+        console.error(`[light] keys.json 写入失败: ${error.message}`);
+      }
+    }, 1e3);
+    saveTimer.unref?.();
+  };
+  const publicView = (k) => ({
+    id: k.id,
+    name: k.name,
+    prefix: k.prefix,
+    enabled: k.enabled,
+    quota: k.quota,
+    used: k.used,
+    remaining: k.quota === null ? null : Math.max(0, k.quota - k.used),
+    exhausted: k.quota !== null && k.used >= k.quota,
+    requests: k.requests ?? 0,
+    createdAt: k.createdAt,
+    updatedAt: k.updatedAt,
+    lastUsedAt: k.lastUsedAt ?? null
+  });
+  const normQuota = (q) => {
+    if (q === null || q === void 0 || q === "" || q === "unlimited") return null;
+    const n = Number(q);
+    if (!Number.isSafeInteger(n) || n < 0) throw new Error("quota 必须是非负整数或 null（不限）");
+    return n;
+  };
+  const normName = (name) => {
+    const s = typeof name === "string" ? name.trim() : "";
+    if (s === "" || s.length > 64) throw new Error("name 必填且不超过 64 字符");
+    return s;
+  };
+  load();
+  return {
+    list: () => keys.map(publicView),
+    get: (id) => {
+      const k = keys.find((x) => x.id === id);
+      return k === void 0 ? null : publicView(k);
+    },
+    create(input) {
+      const raw2 = LIGHT_KEY_PREFIX + lightRandom(24).toString("base64url");
+      const now = Date.now();
+      const k = {
+        id: lightRandom(6).toString("hex"),
+        name: normName(input?.name),
+        hash: lightHashKey(raw2),
+        prefix: raw2.slice(0, 10),
+        enabled: input?.enabled !== false,
+        quota: normQuota(input?.quota),
+        used: 0,
+        requests: 0,
+        createdAt: now,
+        updatedAt: now,
+        lastUsedAt: null
+      };
+      keys.push(k);
+      reindex();
+      saveNow();
+      return { ...publicView(k), key: raw2 };
+    },
+    update(id, patch) {
+      const k = keys.find((x) => x.id === id);
+      if (k === void 0) return null;
+      if (patch.name !== void 0) k.name = normName(patch.name);
+      if (patch.enabled !== void 0) k.enabled = patch.enabled === true;
+      if ("quota" in patch) k.quota = normQuota(patch.quota);
+      if (patch.resetUsage === true) {
+        k.used = 0;
+        k.requests = 0;
+      }
+      k.updatedAt = Date.now();
+      saveNow();
+      return publicView(k);
+    },
+    remove(id) {
+      const before = keys.length;
+      keys = keys.filter((x) => x.id !== id);
+      if (keys.length === before) return false;
+      reindex();
+      saveNow();
+      return true;
+    },
+    /** 原始 key → 存储记录（不存在返回 null） */
+    lookup(raw2) {
+      if (typeof raw2 !== "string" || !raw2.startsWith(LIGHT_KEY_PREFIX)) return null;
+      return byHash.get(lightHashKey(raw2)) ?? null;
+    },
+    /** 请求结束后累计用量（按 id 查，避免删除后仍写回） */
+    charge(id, tokens) {
+      const k = keys.find((x) => x.id === id);
+      if (k === void 0) return;
+      k.used += tokens;
+      k.requests = (k.requests ?? 0) + 1;
+      k.lastUsedAt = Date.now();
+      saveSoon();
+    },
+    flush() {
+      if (saveTimer !== null) saveNow();
+    },
+    get size() {
+      return keys.length;
+    }
+  };
+}
+var LIGHT_KEYS = createKeyStore(DATA_DIR);
+/**
+ * 鉴权：返回 { ok, principal, reason, status }
+ *  - masterKey 命中 → principal master
+ *  - lsk- key 命中且启用、未超额 → principal key
+ *  - masterKey 未设置且没有任何 key → 开放（保持原行为），principal anonymous
+ */
+function lightAuthenticate(authHeader) {
+  const raw2 = typeof authHeader === "string" && authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  const masterKey = resolveMasterKey();
+  if (masterKey !== "" && raw2 === masterKey) {
+    return { ok: true, principal: { kind: "master", keyId: "master", keyName: "masterKey" } };
+  }
+  const rec = LIGHT_KEYS.lookup(raw2);
+  if (rec !== null) {
+    if (!rec.enabled) return { ok: false, reason: "api key disabled", status: 401 };
+    if (rec.quota !== null && rec.used >= rec.quota) {
+      return { ok: false, reason: `quota exceeded (${String(rec.used)}/${String(rec.quota)} tokens)`, status: 429 };
+    }
+    return { ok: true, principal: { kind: "key", keyId: rec.id, keyName: rec.name } };
+  }
+  if (masterKey === "" && LIGHT_KEYS.size === 0) {
+    return { ok: true, principal: { kind: "anonymous", keyId: "anonymous", keyName: "anonymous" } };
+  }
+  return { ok: false, reason: "invalid api key", status: 401 };
+}
+function lightEstimateTokens(text) {
+  if (text === "") return 0;
+  let cjk = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp >= 11904 && cp <= 40959 || cp >= 44032 && cp <= 55215 || cp >= 63744 && cp <= 64255 || cp >= 65280 && cp <= 65519) cjk++;
+  }
+  return cjk + (text.length - cjk) / 4;
+}
+/** 从一个 SSE data JSON 中抽出增量文本与（若有）权威输出 token 数 */
+function lightDeltaOf(obj) {
+  let text = "";
+  let outputTokens = null;
+  if (obj === null || typeof obj !== "object") return { text, outputTokens };
+  const choices = Array.isArray(obj.choices) ? obj.choices : [];
+  for (const ch of choices) {
+    const d = ch?.delta;
+    if (d && typeof d === "object") {
+      if (typeof d.content === "string") text += d.content;
+      if (typeof d.reasoning_content === "string") text += d.reasoning_content;
+      else if (typeof d.reasoning === "string") text += d.reasoning;
+      if (Array.isArray(d.tool_calls)) {
+        for (const tc of d.tool_calls) {
+          if (typeof tc?.function?.arguments === "string") text += tc.function.arguments;
+          if (typeof tc?.function?.name === "string") text += tc.function.name;
+        }
+      }
+    }
+  }
+  const ad = obj.delta;
+  if (ad && typeof ad === "object") {
+    if (typeof ad.text === "string") text += ad.text;
+    if (typeof ad.thinking === "string") text += ad.thinking;
+    if (typeof ad.partial_json === "string") text += ad.partial_json;
+  } else if (typeof ad === "string" && typeof obj.type === "string" && obj.type.endsWith(".delta")) {
+    text += ad;
+  }
+  const usage = obj.usage ?? obj.response?.usage ?? obj.message?.usage;
+  if (usage && typeof usage === "object") {
+    const n = usage.completion_tokens ?? usage.output_tokens;
+    if (typeof n === "number" && n > 0) outputTokens = n;
+  }
+  return { text, outputTokens };
+}
+var LIGHT_WINDOW_MS = 5e3;
+function lightUpstreamLabel(m) {
+  if (m === null || m === void 0) return "";
+  let host = "";
+  try {
+    host = new URL(m.apiBase ?? "").host;
+  } catch {
+  }
+  return host !== "" ? `${m.upstreamModel ?? ""} @ ${host}` : m.upstreamModel ?? "";
+}
+function createLightMonitor() {
+  const active = /* @__PURE__ */ new Map();
+  const events = [];
+  const recent = [];
+  const totals = { keys: /* @__PURE__ */ new Map(), keyModels: /* @__PURE__ */ new Map(), upstreams: /* @__PURE__ */ new Map() };
+  const startedAt2 = Date.now();
+  const bump = (map, k, init, fn) => {
+    let v = map.get(k);
+    if (v === void 0) {
+      v = init();
+      map.set(k, v);
+    }
+    fn(v);
+  };
+  const emptyTotals = () => ({ requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
+  const prune = (now) => {
+    while (events.length > 0 && now - events[0].ts > LIGHT_WINDOW_MS) events.shift();
+  };
+  const identityOf = (hookCtx) => {
+    const p = hookCtx?.principal;
+    return {
+      keyId: p?.keyId ?? "anonymous",
+      keyName: p?.keyName ?? "anonymous"
+    };
+  };
+  return {
+    start(hookCtx) {
+      if (hookCtx === void 0 || active.has(hookCtx.requestId)) return;
+      const { keyId, keyName } = identityOf(hookCtx);
+      const m = hookCtx.model;
+      active.set(hookCtx.requestId, {
+        id: hookCtx.requestId,
+        keyId,
+        keyName,
+        model: m?.name || hookCtx.requestModel || "",
+        provider: m?.provider ?? "",
+        upstreamModel: m?.upstreamModel ?? "",
+        upstream: lightUpstreamLabel(m),
+        inbound: hookCtx.inboundProtocol,
+        startedAt: Date.now(),
+        firstTokenAt: null,
+        lastTokenAt: null,
+        outputTokens: 0,
+        exactOutput: false,
+        streaming: false,
+        decoder: null,
+        buf: ""
+      });
+    },
+    /** SSE 字节经过客户端出口时调用，增量估算 token */
+    chunk(requestId, bytes) {
+      const r = active.get(requestId);
+      if (r === void 0) return;
+      r.streaming = true;
+      if (r.decoder === null) r.decoder = new TextDecoder();
+      r.buf += typeof bytes === "string" ? bytes : r.decoder.decode(bytes, { stream: true });
+      let idx;
+      let added = 0;
+      while ((idx = r.buf.indexOf("\n")) >= 0) {
+        const line = r.buf.slice(0, idx).trim();
+        r.buf = r.buf.slice(idx + 1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "" || payload === "[DONE]") continue;
+        let obj;
+        try {
+          obj = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        const { text, outputTokens } = lightDeltaOf(obj);
+        if (outputTokens !== null && outputTokens > r.outputTokens + added) {
+          added = outputTokens - r.outputTokens;
+          r.exactOutput = true;
+        } else if (text !== "") {
+          added += lightEstimateTokens(text);
+        }
+      }
+      if (r.buf.length > 1048576) r.buf = "";
+      if (added > 0) {
+        const now = Date.now();
+        if (r.firstTokenAt === null) r.firstTokenAt = now;
+        r.lastTokenAt = now;
+        r.outputTokens += added;
+        events.push({ ts: now, requestId, keyId: r.keyId, model: r.model, upstream: r.upstream, tokens: added });
+        prune(now);
+      }
+    },
+    finish(hookCtx, record) {
+      const requestId = hookCtx?.requestId;
+      const r = requestId === void 0 ? void 0 : active.get(requestId);
+      if (requestId !== void 0) active.delete(requestId);
+      const { keyId, keyName } = r ?? identityOf(hookCtx);
+      const model = r?.model ?? hookCtx?.model?.name ?? hookCtx?.requestModel ?? "";
+      const upstream = r !== void 0 ? r.upstream : lightUpstreamLabel(hookCtx?.model);
+      if (r === void 0) return;
+      const u = record?.usage ?? null;
+      const isError = (record?.status ?? 200) >= 400 || record?.error != null;
+      const add = (t) => {
+        t.requests += 1;
+        if (isError) t.errors += 1;
+        t.inputTokens += u?.inputTokens ?? 0;
+        t.outputTokens += u?.outputTokens ?? Math.round(r?.outputTokens ?? 0);
+        t.cacheReadTokens += u?.cacheReadInputTokens ?? 0;
+        t.cacheWriteTokens += u?.cacheCreationInputTokens ?? 0;
+      };
+      bump(totals.keys, keyId, () => ({ keyId, keyName, ...emptyTotals() }), (t) => {
+        t.keyName = keyName;
+        add(t);
+      });
+      bump(totals.keyModels, `${keyId}\0${model}`, () => ({ keyId, keyName, model, ...emptyTotals() }), add);
+      bump(totals.upstreams, upstream, () => ({ upstream, ...emptyTotals() }), add);
+      const out = u?.outputTokens ?? Math.round(r?.outputTokens ?? 0);
+      const genMs = r?.firstTokenAt != null && r.lastTokenAt != null ? r.lastTokenAt - r.firstTokenAt : null;
+      recent.unshift({
+        id: requestId ?? "",
+        keyId,
+        keyName,
+        model,
+        upstream,
+        status: record?.status ?? 0,
+        streaming: record?.streaming ?? false,
+        inputTokens: u?.inputTokens ?? 0,
+        outputTokens: out,
+        durationMs: record?.durationMs ?? 0,
+        ttftMs: r?.firstTokenAt != null ? r.firstTokenAt - r.startedAt : null,
+        tokensPerSec: genMs !== null && genMs > 0 ? Math.round(out / (genMs / 1e3) * 10) / 10 : null,
+        finishedAt: Date.now(),
+        error: record?.error?.message ?? null
+      });
+      if (recent.length > 50) recent.length = 50;
+      if (keyId !== "master" && keyId !== "anonymous" && !(record?.status === 401 || record?.status === 429)) {
+        LIGHT_KEYS.charge(keyId, u !== null ? lightKeyTokens(u) : Math.round(r?.outputTokens ?? 0));
+      }
+    },
+    snapshot() {
+      const now = Date.now();
+      prune(now);
+      const requests = [...active.values()].map((r) => {
+        const windowStart = Math.max(now - LIGHT_WINDOW_MS, r.firstTokenAt ?? now);
+        const span = (now - windowStart) / 1e3;
+        let sum = 0;
+        for (const e of events) if (e.requestId === r.id && e.ts >= windowStart) sum += e.tokens;
+        return {
+          id: r.id,
+          keyId: r.keyId,
+          keyName: r.keyName,
+          model: r.model,
+          upstream: r.upstream,
+          provider: r.provider,
+          upstreamModel: r.upstreamModel,
+          inbound: r.inbound,
+          streaming: r.streaming,
+          elapsedMs: now - r.startedAt,
+          ttftMs: r.firstTokenAt !== null ? r.firstTokenAt - r.startedAt : null,
+          phase: r.firstTokenAt === null ? "waiting" : "generating",
+          outputTokens: Math.round(r.outputTokens),
+          tokensPerSec: span >= 0.5 ? Math.round(sum / span * 10) / 10 : 0,
+          avgTokensPerSec: r.firstTokenAt !== null && now - r.firstTokenAt > 500 ? Math.round(r.outputTokens / ((now - r.firstTokenAt) / 1e3) * 10) / 10 : 0
+        };
+      });
+      const rate = (filter) => Math.round(requests.filter(filter).reduce((acc, r) => acc + r.tokensPerSec, 0) * 10) / 10;
+      const liveName = (keyId, fallback) => LIGHT_KEYS.get(keyId)?.name ?? fallback;
+      for (const r of requests) r.keyName = liveName(r.keyId, r.keyName);
+      const keyMap = /* @__PURE__ */ new Map();
+      for (const t of totals.keys.values()) keyMap.set(t.keyId, { keyId: t.keyId, keyName: t.keyName });
+      for (const r of requests) if (!keyMap.has(r.keyId)) keyMap.set(r.keyId, { keyId: r.keyId, keyName: r.keyName });
+      const keys = [...keyMap.values()].map(({ keyId, keyName: storedName }) => {
+        const keyName = liveName(keyId, storedName);
+        const mine = requests.filter((r) => r.keyId === keyId);
+        const modelNames = /* @__PURE__ */ new Set([...mine.map((r) => r.model)]);
+        for (const t of totals.keyModels.values()) if (t.keyId === keyId) modelNames.add(t.model);
+        return {
+          keyId,
+          keyName,
+          inFlight: mine.length,
+          tokensPerSec: rate((e) => e.keyId === keyId),
+          activeModels: [...new Set(mine.map((r) => r.model))],
+          models: [...modelNames].map((model) => ({
+            model,
+            inFlight: mine.filter((r) => r.model === model).length,
+            tokensPerSec: rate((e) => e.keyId === keyId && e.model === model),
+            totals: totals.keyModels.get(`${keyId}\0${model}`) ?? emptyTotals()
+          })),
+          totals: totals.keys.get(keyId) ?? emptyTotals()
+        };
+      });
+      const upstreamNames = /* @__PURE__ */ new Set([...totals.upstreams.keys(), ...requests.map((r) => r.upstream)]);
+      const upstreams = [...upstreamNames].map((upstream) => ({
+        upstream,
+        inFlight: requests.filter((r) => r.upstream === upstream).length,
+        tokensPerSec: rate((e) => e.upstream === upstream),
+        totals: totals.upstreams.get(upstream) ?? emptyTotals()
+      }));
+      return {
+        now,
+        since: startedAt2,
+        windowMs: LIGHT_WINDOW_MS,
+        totalTokensPerSec: rate(() => true),
+        inFlight: requests.length,
+        requests,
+        keys,
+        upstreams,
+        recent
+      };
+    }
+  };
+}
+var LIGHT_MONITOR = createLightMonitor();
+function createKeysApp() {
+  const app3 = new Hono2();
+  app3.get("/", (c) => c.json({ keys: LIGHT_KEYS.list() }));
+  app3.post("/", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      return c.json(LIGHT_KEYS.create(body), 201);
+    } catch (error) {
+      return c.json({ error: error.message }, 400);
+    }
+  });
+  const updateKey = async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const updated = LIGHT_KEYS.update(c.req.param("id"), body);
+      return updated === null ? c.json({ error: "key not found" }, 404) : c.json(updated);
+    } catch (error) {
+      return c.json({ error: error.message }, 400);
+    }
+  };
+  app3.patch("/:id", updateKey);
+  app3.put("/:id", updateKey);
+  app3.delete("/:id", (c) => LIGHT_KEYS.remove(c.req.param("id")) ? c.json({ ok: true }) : c.json({ error: "key not found" }, 404));
+  return app3;
+}
+function createMonitorApp() {
+  const app3 = new Hono2();
+  app3.get("/live", (c) => c.json(LIGHT_MONITOR.snapshot()));
+  return app3;
+}
+
 // ../../packages/server/src/app.ts
 function createApp(runtime2, admin, listen2) {
   const app3 = new Hono2();
@@ -26014,6 +26730,8 @@ function createApp(runtime2, admin, listen2) {
   app3.route("/api/usage", createUsageApp());
   app3.route("/api/logs", createLogsApp());
   app3.route("/api/status", createStatusApp(runtime2, listen2));
+  app3.route("/api/keys", createKeysApp());
+  app3.route("/api/monitor", createMonitorApp());
   if (admin) {
     app3.route("/", createServiceRoutes(admin));
     app3.route("/", createServiceSettingsRoutes(admin));
@@ -26032,7 +26750,7 @@ function createApp(runtime2, admin, listen2) {
   );
   app3.onError((err, c) => {
     console.error(
-      `[ellm] ${c.req.method} ${c.req.path} \u5931\u8D25:`,
+      `[light] ${c.req.method} ${c.req.path} \u5931\u8D25:`,
       err?.message ?? err
     );
     return c.json({ ok: false, error: err?.message ?? String(err) }, 500);
@@ -26043,12 +26761,12 @@ function createApp(runtime2, admin, listen2) {
 // ../../packages/server/server.ts
 import { dirname as dirname7, resolve as resolve7 } from "node:path";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
-var SERVER_JS = process.env["ELLM_SERVER_JS"] ?? resolve7(dirname7(fileURLToPath4(import.meta.url)), "server.js");
+var SERVER_JS = process.env["LIGHT_SERVER_JS"] ?? resolve7(dirname7(fileURLToPath4(import.meta.url)), "server.js");
 await bootstrapPendingUpdate({ appDir: APP_DIR, serverJs: SERVER_JS });
 var loaded = readStartupConfig();
 if (loaded === null) {
   console.error(
-    `[ellm] \u7F3A\u5C11\u914D\u7F6E\u6587\u4EF6 ${CONFIG_PATH}\uFF08\u53C2\u8003 ellm.config.example.json\uFF09`
+    `[light] \u7F3A\u5C11\u914D\u7F6E\u6587\u4EF6 ${CONFIG_PATH}\uFF08\u53C2\u8003 light.config.example.json\uFF09`
   );
   process.exit(1);
 }
@@ -26060,16 +26778,13 @@ var runtime = createRuntime(
   {
     // /v1/models 转发层鉴权（SDK bug 兜底，语义与 onAuthorize 一致）
     authorize(authHeader) {
-      const masterKey = resolveMasterKey();
-      if (masterKey === "") return true;
-      return authHeader === `Bearer ${masterKey}`;
+      return lightAuthenticate(authHeader).ok;
     },
-    register(ellm) {
-      ellm.addHook("onAuthorize", (ctx) => {
-        const masterKey = resolveMasterKey();
-        if (masterKey === "") return;
-        const key = ctx.headers["authorization"] ?? "";
-        if (key !== `Bearer ${masterKey}`) ctx.reject("invalid api key");
+    register(light) {
+      light.addHook("onAuthorize", (ctx) => {
+        const result = lightAuthenticate(ctx.headers["authorization"] ?? "");
+        if (result.ok) ctx.principal = result.principal;
+        else ctx.reject(result.reason, result.status);
       });
     }
   },
@@ -26092,16 +26807,16 @@ function runLogPrune() {
     const result = pruneLogs(detailDays, rowDays);
     if (result.detailsDeleted > 0 || result.rowsDeleted > 0 || result.blobsDeleted > 0) {
       console.log(
-        `[ellm] \u65E5\u5FD7\u6E05\u7406: \u8BE6\u60C5 -${String(result.detailsDeleted)}, \u6458\u8981 -${String(result.rowsDeleted)}, blob -${String(result.blobsDeleted)} (\u8BE6\u60C5${detailDays > 0 ? ` ${String(detailDays)}\u5929` : "\u6C38\u4E45"}, \u6458\u8981${rowDays > 0 ? ` ${String(rowDays)}\u5929` : "\u6C38\u4E45"})`
+        `[light] \u65E5\u5FD7\u6E05\u7406: \u8BE6\u60C5 -${String(result.detailsDeleted)}, \u6458\u8981 -${String(result.rowsDeleted)}, blob -${String(result.blobsDeleted)} (\u8BE6\u60C5${detailDays > 0 ? ` ${String(detailDays)}\u5929` : "\u6C38\u4E45"}, \u6458\u8981${rowDays > 0 ? ` ${String(rowDays)}\u5929` : "\u6C38\u4E45"})`
       );
     }
   } catch (error) {
-    console.error("[ellm] \u65E5\u5FD7\u6E05\u7406\u5931\u8D25:", error.message);
+    console.error("[light] \u65E5\u5FD7\u6E05\u7406\u5931\u8D25:", error.message);
   }
 }
 setTimeout(runLogPrune, 3e4).unref();
 setInterval(runLogPrune, PRUNE_INTERVAL_MS).unref();
-var port = Number(process.env["ELLM_PORT"] ?? runtime.port);
+var port = Number(process.env["LIGHT_PORT"] ?? runtime.port);
 var server = await startServe(app2, port, listen.hostname);
 var listenPort = server ?? port;
 adminContext.port = listenPort;
@@ -26112,15 +26827,15 @@ writeRunInfo(APP_DIR, {
   serverJs: SERVER_JS,
   version: readPkgVersion(),
   appDir: APP_DIR,
-  config: process.env["ELLM_CONFIG"] ?? null,
-  dataDir: process.env["ELLM_DATA_DIR"] ?? null
+  config: process.env["LIGHT_CONFIG"] ?? null,
+  dataDir: process.env["LIGHT_DATA_DIR"] ?? null
 });
 installCrashRecovery({ serverJs: SERVER_JS, appDir: APP_DIR });
 startUpdateScheduler({ appDir: APP_DIR, serverJs: SERVER_JS });
 startLatencyAutoTest(runtime);
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
-    console.log(`[ellm] \u6536\u5230 ${signal}\uFF0C\u670D\u52A1\u9000\u51FA`);
+    console.log(`[light] \u6536\u5230 ${signal}\uFF0C\u670D\u52A1\u9000\u51FA`);
     clearRunInfo(APP_DIR);
     void Promise.race([
       traceSink.flush(),
@@ -26130,7 +26845,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 printBanner(listenPort, listen);
 async function startServe(app3, port2, hostname) {
-  const respawned = process.env["ELLM_RESPAWNED"] === "1";
+  const respawned = process.env["LIGHT_RESPAWNED"] === "1";
   const deadline = Date.now() + 1e4;
   for (; ; ) {
     try {
@@ -26163,7 +26878,7 @@ function printBanner(port2, listen2) {
   const where = bindsAllInterfaces(listen2.hostname) ? "\u5168\u90E8\u7F51\u5361" : listen2.hostname;
   const why = listen2.source === "credentials" ? "\u672A\u8BBE\u7F6E\u4EFB\u4F55\u51ED\u636E\uFF08\u4E3B\u5BC6\u94A5\u4E0E\u767B\u5F55\u8D26\u53F7\u7686\u65E0\uFF09\uFF0C\u5F3A\u5236\u4EC5\u672C\u673A\uFF08HOST \u4E0E\u8BBE\u7F6E\u9875\u5F00\u5173\u5747\u5DF2\u5FFD\u7565\uFF09" : listen2.source === "env" ? "HOST \u73AF\u5883\u53D8\u91CF\u8986\u76D6" : listen2.hostname === "127.0.0.1" ? "\u8BBE\u7F6E\u9875\u300C\u5141\u8BB8\u5C40\u57DF\u7F51\u8BBF\u95EE\u300D\u5DF2\u5173\u95ED" : "\u8BBE\u7F6E\u9875\u300C\u5141\u8BB8\u5C40\u57DF\u7F51\u8BBF\u95EE\u300D\u5F00\u542F\uFF08\u7F3A\u7701\uFF09";
   console.log("========================================");
-  console.log("  Ellm \u670D\u52A1\uFF08\u7F51\u5173 + \u7BA1\u7406\u53F0\uFF0C\u5355\u8FDB\u7A0B\uFF09");
+  console.log("  Light \u670D\u52A1\uFF08\u7F51\u5173 + \u7BA1\u7406\u53F0\uFF0C\u5355\u8FDB\u7A0B\uFF09");
   console.log(`  \u7F51\u5173\u7AEF\u70B9: http://${display}:${String(port2)}/v1/*`);
   console.log(
     `  \u7BA1\u7406\u53F0:   http://${display}:${String(port2)}/\uFF08\u7BA1\u7406 API \u4E0E\u754C\u9762\u540C\u7AEF\u53E3\uFF0C\u767B\u5F55\u540E\u4F7F\u7528\uFF09`
